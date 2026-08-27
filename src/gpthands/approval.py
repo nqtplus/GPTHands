@@ -31,16 +31,25 @@ def workspace_id(workspace: Path) -> str:
 
 
 class ApprovalManager:
-    def __init__(self, key_path: Path) -> None:
-        self.key_path = key_path.expanduser()
-        self.key_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, key_path: Path, used_path: Path | None = None) -> None:
+        lexical = key_path.expanduser()
+        lexical.parent.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            try:
+                os.chmod(lexical.parent, 0o700)
+            except OSError:
+                pass
+        self.key_path = lexical
+        self.used_path = (used_path or lexical.with_name("approval-used.jsonl")).expanduser()
+        if self.used_path.is_symlink():
+            raise ApprovalError("approval replay store must not be a symlink")
         self._key = self._load_or_create_key()
-        self._consumed: set[str] = set()
+        self._consumed = self._load_consumed()
 
     def _load_or_create_key(self) -> bytes:
+        if self.key_path.is_symlink():
+            raise ApprovalError("approval key must not be a symlink")
         if self.key_path.exists():
-            if self.key_path.is_symlink():
-                raise ApprovalError("approval key must not be a symlink")
             info = self.key_path.stat()
             if os.name != "nt":
                 if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
@@ -53,6 +62,8 @@ class ApprovalManager:
             return data
 
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
         fd = os.open(self.key_path, flags, 0o600)
         try:
             data = secrets.token_bytes(32)
@@ -61,6 +72,37 @@ class ApprovalManager:
         finally:
             os.close(fd)
         return data
+
+    def _load_consumed(self) -> set[str]:
+        if not self.used_path.exists():
+            return set()
+        info = self.used_path.stat()
+        if os.name != "nt" and info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            raise ApprovalError("approval replay store permissions must be 0600")
+        consumed: set[str] = set()
+        try:
+            for line in self.used_path.read_text(encoding="utf-8").splitlines():
+                if line:
+                    consumed.add(line.strip())
+        except OSError as exc:
+            raise ApprovalError(f"cannot read approval replay store: {exc}") from exc
+        return consumed
+
+    def _mark_consumed(self, nonce: str) -> None:
+        flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(self.used_path, flags, 0o600)
+        try:
+            if os.name != "nt":
+                os.fchmod(fd, 0o600)
+            os.write(fd, (nonce + "\n").encode("ascii"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        self._consumed.add(nonce)
 
     def issue(
         self,
@@ -128,5 +170,5 @@ class ApprovalManager:
         if not nonce or nonce in self._consumed:
             raise ApprovalError("approval token was already used")
         if consume:
-            self._consumed.add(nonce)
+            self._mark_consumed(nonce)
         return payload
