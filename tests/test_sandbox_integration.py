@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from gpthands.sandbox import SandboxRunner
+from gpthands.sandbox import SandboxError, SandboxRunner
 
 
 @unittest.skipUnless(platform.system() == "Linux" and shutil.which("bwrap"), "bubblewrap integration requires Linux + bwrap")
@@ -33,23 +33,53 @@ class BubblewrapIntegrationTests(unittest.TestCase):
         )
 
     def test_readonly_workspace_rejects_write(self) -> None:
+        # Share host networking for this test so it isolates the filesystem
+        # behavior from kernels that disallow unprivileged network namespaces.
         target = self.workspace / "blocked.txt"
-        completed, backend = self.run_box(["/bin/sh", "-c", f"printf x > '{target}'"], allow_write=False)
+        completed, backend = self.run_box(
+            ["/bin/sh", "-c", f"printf x > '{target}'"],
+            allow_write=False,
+            allow_network=True,
+        )
         self.assertEqual(backend, "bubblewrap")
         self.assertNotEqual(completed.returncode, 0)
         self.assertFalse(target.exists())
 
     def test_write_mount_is_explicit(self) -> None:
         target = self.workspace / "allowed.txt"
-        completed, backend = self.run_box(["/bin/sh", "-c", f"printf x > '{target}'"], allow_write=True)
+        completed, backend = self.run_box(
+            ["/bin/sh", "-c", f"printf x > '{target}'"],
+            allow_write=True,
+            allow_network=True,
+        )
         self.assertEqual(backend, "bubblewrap")
         self.assertEqual(completed.returncode, 0, completed.stdout.decode("utf-8", errors="replace"))
         self.assertEqual(target.read_text(encoding="utf-8"), "x")
 
-    def test_network_namespace_has_no_routes_when_network_denied(self) -> None:
-        completed, backend = self.run_box(["/bin/cat", "/proc/net/route"], allow_network=False)
+    def test_network_denial_is_isolated_or_fails_closed(self) -> None:
+        marker = self.workspace / "target-ran.txt"
+        command = [
+            "/bin/sh",
+            "-c",
+            f"printf ran > '{marker}'; /bin/cat /proc/net/route",
+        ]
+        try:
+            completed, backend = self.run_box(
+                command,
+                allow_write=True,
+                allow_network=False,
+            )
+        except SandboxError as exc:
+            # Some hosted kernels forbid unprivileged network namespace setup.
+            # Secure behavior is to refuse the target rather than silently share
+            # host networking.
+            self.assertIn("network namespace isolation is unavailable", str(exc))
+            self.assertFalse(marker.exists(), "target command must not run when netns setup fails")
+            return
+
         self.assertEqual(backend, "bubblewrap")
-        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.returncode, 0, completed.stdout.decode("utf-8", errors="replace"))
+        self.assertEqual(marker.read_text(encoding="utf-8"), "ran")
         lines = [line for line in completed.stdout.decode("utf-8", errors="replace").splitlines() if line.strip()]
         self.assertLessEqual(len(lines), 1, completed.stdout.decode("utf-8", errors="replace"))
 
