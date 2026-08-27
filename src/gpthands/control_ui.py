@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .approval import ApprovalManager
 from .diagnostics import diagnostic_report
+from .pending_approvals import PendingApprovalStore
 from .risk import RiskLevel
 from .state import state_root
 from .trust import WorkspaceTrustStore
@@ -28,6 +29,7 @@ class _Server(ThreadingHTTPServer):
         self.workspace = workspace.resolve(strict=True)
         self.csrf_token = secrets.token_urlsafe(32)
         self.trust_store = WorkspaceTrustStore()
+        self.pending_store = PendingApprovalStore()
         self.approvals = ApprovalManager(state_root() / "approval.key")
 
     def switch_workspace(self, candidate: str) -> None:
@@ -41,6 +43,7 @@ class _Server(ThreadingHTTPServer):
     def server_close(self) -> None:
         try:
             self.approvals.close()
+            self.pending_store.close()
         finally:
             super().server_close()
 
@@ -81,19 +84,43 @@ class ControlHandler(BaseHTTPRequestHandler):
         if not secrets.compare_digest(supplied, self.server.csrf_token):
             raise ControlUIError("invalid local UI authorization token")
 
+    @staticmethod
+    def _valid_action_hash(action_hash: str) -> bool:
+        return len(action_hash) == 64 and all(ch in "0123456789abcdef" for ch in action_hash)
+
+    def _issue_token(self, *, risk: RiskLevel, action_hash: str, seconds: int) -> str:
+        if not self._valid_action_hash(action_hash):
+            raise ControlUIError("action hash must be 64 lowercase hexadecimal characters")
+        return self.server.approvals.issue(
+            workspace=self.server.workspace,
+            risk=risk,
+            ttl_seconds=seconds,
+            action_hash=action_hash,
+        )
+
+    def _token_page(self, token: str, *, action_hash: str) -> None:
+        self._html(
+            "<h1>Approval issued</h1><p>This token is one-time, short-lived, and bound to the exact action.</p>"
+            f"<p><code>{html.escape(action_hash)}</code></p>"
+            f"<textarea cols=100 rows=6 readonly>{html.escape(token)}</textarea><p><a href='/'>Back</a></p>"
+        )
+
     def do_GET(self) -> None:
         if self.path == "/api/status":
             report = diagnostic_report(self.server.workspace)
             report["trusted"] = self.server.trust_store.is_trusted(self.server.workspace)
             report["trusted_workspaces"] = self.server.trust_store.list()
+            report["pending_approvals"] = self.server.pending_store.list_for_workspace(self.server.workspace)
             self._headers(content_type="application/json; charset=utf-8")
             self.wfile.write(json.dumps(report, ensure_ascii=False).encode("utf-8"))
             return
         if self.path not in {"/", "/index.html"}:
             self._html("<h1>Not found</h1>", status=HTTPStatus.NOT_FOUND)
             return
+
         trusted = self.server.trust_store.is_trusted(self.server.workspace)
         trusted_rows = self.server.trust_store.list()
+        pending = self.server.pending_store.list_for_workspace(self.server.workspace)
         report = diagnostic_report(self.server.workspace)
         rows = "".join(
             f"<tr><td>{html.escape(c['name'])}</td><td>{html.escape(c['status'])}</td><td>{html.escape(c['detail'])}</td></tr>"
@@ -115,18 +142,33 @@ class ControlHandler(BaseHTTPRequestHandler):
             f'<select name=workspace>{switch_options}</select><button>Switch workspace</button></form>'
             if switch_options else "<p class=muted>No trusted workspace saved yet.</p>"
         )
+        pending_rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('risk', '')))}</td>"
+            f"<td><code>{html.escape(str(row.get('action_hash', '')))}</code></td>"
+            f"<td>{html.escape(str(row.get('last_seen_at', '')))}</td>"
+            "<td><form method=post action=/approve-pending>"
+            f'<input type=hidden name=csrf value="{token}">'
+            f'<input type=hidden name=action_hash value="{html.escape(str(row.get("action_hash", "")))}">'
+            "<input type=hidden name=seconds value=300>"
+            "<button>Approve 5 min</button></form></td></tr>"
+            for row in pending
+        ) or "<tr><td colspan=4 class=muted>No action is waiting for approval.</td></tr>"
+
         body = f"""
 <style>
-body{{font:14px system-ui;max-width:980px;margin:36px auto;padding:0 18px;color:#1f2328}}h1{{margin-bottom:4px}}.muted{{color:#667085}}.ok{{color:#067647}}.warn{{color:#b54708}}table{{border-collapse:collapse;width:100%;margin:18px 0}}td,th{{border:1px solid #ddd;padding:8px;text-align:left}}fieldset{{margin:18px 0;padding:14px}}input,select,button{{padding:8px;margin:4px}}code{{word-break:break-all}}
+body{{font:14px system-ui;max-width:1040px;margin:36px auto;padding:0 18px;color:#1f2328}}h1{{margin-bottom:4px}}.muted{{color:#667085}}.ok{{color:#067647}}.warn{{color:#b54708}}table{{border-collapse:collapse;width:100%;margin:18px 0}}td,th{{border:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}fieldset{{margin:18px 0;padding:14px}}input,select,button{{padding:8px;margin:4px}}code{{word-break:break-all}}
 </style>
 <h1>GPTHands v0.4 Control</h1>
-<p class=muted>Loopback-only local control surface. No credentials are rendered here.</p>
+<p class=muted>Loopback-only local control surface. No credentials or command contents are rendered here.</p>
 <p><strong>Workspace:</strong> <code>{workspace}</code></p>
 <p><strong>Trust:</strong> {'<span class=ok>trusted</span>' if trusted else '<span class=warn>not trusted</span>'}</p>
 <form method=post action=/{trust_action}><input type=hidden name=csrf value="{token}"><button>{trust_label}</button></form>
 <fieldset><legend>Trusted workspace switcher</legend>{switch_form}</fieldset>
+<h2>Pending approvals</h2>
+<table><tr><th>Risk</th><th>Exact action hash</th><th>Last seen</th><th>Action</th></tr>{pending_rows}</table>
 <h2>Diagnostics</h2><table><tr><th>Check</th><th>Status</th><th>Detail</th></tr>{rows}</table>
-<fieldset><legend>Issue action-bound approval</legend>
+<fieldset><legend>Manual action-bound approval</legend>
 <form method=post action=/approve>
 <input type=hidden name=csrf value="{token}">
 <label>Risk <select name=risk>{''.join(f'<option>{r.name}</option>' for r in RiskLevel)}</select></label>
@@ -150,23 +192,26 @@ body{{font:14px system-ui;max-width:980px;margin:36px auto;padding:0 18px;color:
             if self.path == "/switch":
                 self.server.switch_workspace(form.get("workspace", ""))
                 return self._redirect()
+            if self.path == "/approve-pending":
+                action_hash = form.get("action_hash", "").strip()
+                matches = [
+                    row for row in self.server.pending_store.list_for_workspace(self.server.workspace)
+                    if row.get("action_hash") == action_hash
+                ]
+                if len(matches) != 1:
+                    raise ControlUIError("pending action no longer exists for this workspace")
+                risk = RiskLevel.parse(str(matches[0].get("risk", "")))
+                seconds = int(form.get("seconds", "300"))
+                token = self._issue_token(risk=risk, action_hash=action_hash, seconds=seconds)
+                self.server.pending_store.remove(workspace=self.server.workspace, action_hash=action_hash)
+                return self._token_page(token, action_hash=action_hash)
             if self.path == "/approve":
                 risk = RiskLevel.parse(form.get("risk", ""))
                 action_hash = form.get("action_hash", "").strip()
-                if len(action_hash) != 64 or any(ch not in "0123456789abcdef" for ch in action_hash):
-                    raise ControlUIError("action hash must be 64 lowercase hexadecimal characters")
                 seconds = int(form.get("seconds", "300"))
-                token = self.server.approvals.issue(
-                    workspace=self.server.workspace,
-                    risk=risk,
-                    ttl_seconds=seconds,
-                    action_hash=action_hash,
-                )
-                self._html(
-                    "<h1>Approval issued</h1><p>This token is one-time, short-lived, and bound to the action hash.</p>"
-                    f"<textarea cols=100 rows=6 readonly>{html.escape(token)}</textarea><p><a href='/'>Back</a></p>"
-                )
-                return
+                token = self._issue_token(risk=risk, action_hash=action_hash, seconds=seconds)
+                self.server.pending_store.remove(workspace=self.server.workspace, action_hash=action_hash)
+                return self._token_page(token, action_hash=action_hash)
             self._html("<h1>Not found</h1>", status=HTTPStatus.NOT_FOUND)
         except (ValueError, ControlUIError) as exc:
             self._html(f"<h1>Request refused</h1><pre>{html.escape(str(exc))}</pre>", status=HTTPStatus.BAD_REQUEST)
