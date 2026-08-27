@@ -4,6 +4,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -20,6 +21,35 @@ class TunnelError(RuntimeError):
 _TUNNEL_ID = re.compile(r"^tunnel_[0-9a-f]{32}$")
 _MAX_TUNNEL_OUTPUT_BYTES = 1_000_000
 _TRUNCATED = "\n[output truncated by GPTHands tunnel policy]"
+
+# The tunnel process is privileged transport. Do not hand it unrelated secrets
+# inherited from the user's shell. Keep only runtime variables needed to find
+# executables, user-local GPTHands state, temporary directories and CA roots;
+# inject the control-plane credential explicitly below. Proxy variables are
+# intentionally excluded because their URLs can embed credentials.
+_TUNNEL_ENV_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "PATHEXT",
+        "HOME",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -78,8 +108,16 @@ def build_tunnel_plan(*, workspace: Path, tunnel_id: str, profile: str = "gpthan
     )
 
 
+def _sanitized_runtime_env() -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key.upper() in _TUNNEL_ENV_ALLOWLIST:
+            env[key] = value
+    return env
+
+
 def _runtime_env(credential_name: str | None) -> tuple[dict[str, str], str | None]:
-    env = dict(os.environ)
+    env = _sanitized_runtime_env()
     secret: str | None = None
     if credential_name:
         try:
@@ -96,6 +134,21 @@ def _redact_tunnel_output(text: str, secret: str | None) -> str:
     return redact_text(text)
 
 
+def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
 def execute_tunnel_step(
     argv: list[str],
     *,
@@ -107,21 +160,26 @@ def execute_tunnel_step(
     effective_timeout = None if len(argv) > 1 and argv[1] == "run" else timeout
     env, secret = _runtime_env(credential_name)
 
+    popen_kwargs: dict[str, object] = {
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": False,
+        "shell": False,
+    }
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    else:
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
     try:
-        process = subprocess.Popen(
-            argv,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=False,
-            shell=False,
-        )
+        process = subprocess.Popen(argv, **popen_kwargs)  # type: ignore[arg-type]
     except OSError as exc:
         raise TunnelError(f"tunnel-client execution failed: {exc}") from exc
 
     if process.stdout is None:  # pragma: no cover - guaranteed by PIPE
-        process.kill()
+        _terminate_process_tree(process)
         raise TunnelError("tunnel-client stdout pipe was not created")
 
     retained = bytearray()
@@ -147,13 +205,21 @@ def execute_tunnel_step(
     try:
         process.wait(timeout=effective_timeout)
     except subprocess.TimeoutExpired as exc:
-        process.kill()
+        _terminate_process_tree(process)
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            process.kill()
+            _terminate_process_tree(process)
         reader.join(timeout=5)
         raise TunnelError("tunnel-client execution timed out") from exc
+    except KeyboardInterrupt as exc:
+        _terminate_process_tree(process)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _terminate_process_tree(process)
+        reader.join(timeout=5)
+        raise TunnelError("tunnel-client execution interrupted") from exc
 
     reader.join(timeout=5)
     if reader.is_alive():
