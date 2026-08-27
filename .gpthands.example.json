@@ -1,0 +1,10 @@
+{
+  "allow_write": false,
+  "allow_process": false,
+  "allow_network_commands": false,
+  "allowed_commands": [],
+  "max_read_bytes": 1000000,
+  "max_write_bytes": 1000000,
+  "max_command_seconds": 30,
+  "max_output_bytes": 200000
+}
