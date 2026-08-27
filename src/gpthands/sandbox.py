@@ -144,10 +144,7 @@ class SandboxRunner:
             bwrap,
             "--die-with-parent",
             "--new-session",
-            "--unshare-user",
-            "--unshare-ipc",
-            "--unshare-pid",
-            "--unshare-uts",
+            "--unshare-all",
             # UID/GID 0 is only inside the new user namespace and maps to the
             # invoking host user; it does not grant host root authority.
             "--uid",
@@ -155,8 +152,10 @@ class SandboxRunner:
             "--gid",
             "0",
         ]
-        if not allow_network:
-            args.append("--unshare-net")
+        # --unshare-all includes a network namespace. Sharing the host network
+        # back in is only allowed for explicitly network-authorized actions.
+        if allow_network:
+            args.append("--share-net")
 
         for system_path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"):
             if Path(system_path).exists():
