@@ -28,14 +28,91 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: ""
 
-      - name: Install package without dependencies
+      - name: Install package without runtime dependencies
         run: python -m pip install --disable-pip-version-check --no-deps -e .
 
       - name: Compile
-        run: python -m compileall -q src tests
+        run: python -m compileall -q src tests scripts
 
-      - name: Security regression suite
+      - name: Security regression and deterministic fuzz suite
         run: python -m unittest discover -s tests -v
+
+  adversarial-properties:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: ""
+
+      - name: Install project and pinned Hypothesis
+        run: |
+          python -m pip install --disable-pip-version-check --no-deps -e .
+          python -m pip install --disable-pip-version-check 'hypothesis==6.165.10'
+
+      - name: Property-based security tests
+        run: python -m unittest discover -s tests -p 'test_properties.py' -v
+
+  supply-chain:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: ""
+
+      - name: Install pinned build and audit tools
+        run: python -m pip install --disable-pip-version-check -r requirements/ci-tools.txt
+
+      - name: Audit pinned CI and build dependencies
+        run: python -m pip_audit -r requirements/ci-tools.txt --strict
+
+      - name: Build twice and prove wheel reproducibility
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export PYTHONHASHSEED=0
+          rm -rf build dist dist-a dist-b src/*.egg-info
+          python -m build --wheel --no-isolation --outdir dist-a
+          rm -rf build src/*.egg-info
+          python -m build --wheel --no-isolation --outdir dist-b
+          python scripts/compare_artifacts.py dist-a dist-b
+          mkdir -p dist
+          cp dist-a/* dist/
+
+      - name: Generate deterministic CycloneDX SBOM and checksums
+        run: |
+          python scripts/generate_sbom.py --output dist/gpthands.cdx.json
+          python scripts/checksums.py dist/*.whl dist/gpthands.cdx.json --output dist/SHA256SUMS
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          bom = json.loads(Path('dist/gpthands.cdx.json').read_text())
+          assert bom['bomFormat'] == 'CycloneDX'
+          assert bom['specVersion'] == '1.6'
+          assert bom['metadata']['component']['version'] == '0.3.0'
+          assert Path('dist/SHA256SUMS').stat().st_size > 0
+          PY
+
+      - name: Upload verified supply-chain artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gpthands-v0.3-supply-chain
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
 
   linux-sandbox-integration:
     runs-on: ubuntu-24.04
@@ -90,3 +167,23 @@ jobs:
 
       - name: Real macOS sandbox isolation tests
         run: python -m unittest discover -s tests -p 'test_macos_sandbox_integration.py' -v
+
+  windows-fail-closed:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: ""
+
+      - name: Install package without dependencies
+        run: python -m pip install --disable-pip-version-check --no-deps -e .
+
+      - name: Verify unsupported Windows process sandbox fails closed
+        run: python -m unittest discover -s tests -p 'test_windows_security.py' -v
