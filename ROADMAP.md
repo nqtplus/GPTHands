@@ -91,16 +91,32 @@ Current candidate: **`1.0.0rc1`**. Internal implementation and CI gates are comp
 - [x] Real Job Object child inheritance / `KILL_ON_JOB_CLOSE` integration proof
 - [x] Real installer install → upgrade → rollback smoke tests on Ubuntu, macOS and Windows
 - [x] Reproducible RC wheel + deterministic platform bundles + SBOM + SHA256SUMS
+- [x] Workflow-enforced stable-release review metadata gate
+- [x] Reviewed-baseline ancestry + post-review changed-file allowlist verification
+- [x] Exact RC → stable version-only validation for `pyproject.toml`, `__init__.py` and `stable_server.py`
+- [x] Real temporary-Git-history tests proving post-review runtime injection is rejected
+- [x] Mandatory wheel SHA-256 verification before packaged install
+- [x] Same-version wheel substitution refusal + per-version local digest binding
+- [x] Digest-bound rollback marker verification before launcher switch
+- [x] Direct symlink refusal for wheel/install root/bin/releases/version targets and managed installer state
 
 ### Stable-release gate
 
 `v1.0.0` must not be tagged as stable until all of the following are true:
 
-1. independent security review completed;
-2. critical/high findings fixed or explicitly dispositioned;
-3. full CI matrix green on the reviewed commit;
-4. package version changed from `1.0.0rcN` to `1.0.0`;
-5. release tag matches the package version exactly;
-6. release artifacts, checksums, provenance and SBOM attestations are published from that tag.
+1. independent security review completed against the final RC baseline commit;
+2. critical/high findings fixed or explicitly dispositioned, with `critical_open == 0` and `high_open == 0` in the review record;
+3. full CI matrix green on the final reviewed/fixed RC baseline;
+4. `docs/reviews/v1.0.0.json` records the real independent reviewer, reviewed SHA, timezone-qualified completion time and HTTPS report;
+5. stable promotion changes only review evidence, release-status documentation and exact `1.0.0rcN → 1.0.0` version substitutions;
+6. release workflow verifies reviewed-commit ancestry and rejects any post-review runtime/security change;
+7. release tag matches the package version exactly;
+8. release artifacts, SHA256SUMS, provenance and SBOM attestations are published from that tag.
+
+Tracking issue: https://github.com/nqtplus/GPTHands/issues/1
+
+### Repository-governance recommendation
+
+The repository currently exposes no GitHub repository rulesets through the connected API. Before a public stable release, configure a GitHub ruleset/branch policy requiring the full CI workflow for protected release changes if the repository plan/settings support it. This is defense-in-depth around maintainer workflows; it does not replace the runtime security model or the external-review gate.
 
 See `docs/EXTERNAL_SECURITY_REVIEW.md`, `docs/MCP_COMPATIBILITY.md`, `docs/SECURE_DEPLOYMENT_PROFILES.md`, and `docs/UPGRADE_ROLLBACK.md`.
