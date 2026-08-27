@@ -8,6 +8,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .process_control import ProcessControlError, run_bounded_process
 from .windows_classic import WindowsAppContainerSandbox
 from .windows_sandbox import WindowsSandboxError
 
@@ -130,20 +131,21 @@ class SandboxRunner:
                 proc_env["HOME"] = str(isolated_home)
                 proc_env["TMPDIR"] = str(isolated_home)
             try:
-                completed = subprocess.run(
+                bounded = run_bounded_process(
                     plan.argv,
                     cwd=cwd,
                     env=proc_env,
-                    shell=False,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
                     timeout=timeout,
-                    check=False,
-                    start_new_session=True,
+                    max_output_bytes=max_output_bytes,
                 )
-            except subprocess.TimeoutExpired as exc:
-                raise SandboxError(f"command exceeded {timeout}s timeout") from exc
+            except ProcessControlError as exc:
+                raise SandboxError(str(exc)) from exc
+            completed = subprocess.CompletedProcess(
+                args=plan.argv,
+                returncode=bounded.returncode,
+                stdout=bounded.stdout,
+                stderr=None,
+            )
 
         if plan.backend == "bubblewrap" and completed.returncode != 0:
             diagnostic = completed.stdout.decode("utf-8", errors="replace").strip()
@@ -158,8 +160,6 @@ class SandboxRunner:
                     )
                 raise SandboxError(f"bubblewrap sandbox setup failed: {diagnostic[:500]}")
 
-        if len(completed.stdout) > max_output_bytes:
-            completed.stdout = completed.stdout[:max_output_bytes] + b"\n[output truncated by GPTHands policy]"
         return completed, plan.backend
 
     @staticmethod
