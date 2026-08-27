@@ -102,7 +102,19 @@ jobs:
         run: python -m pip install --disable-pip-version-check -r requirements/ci-tools.txt
 
       - name: Audit pinned CI and build dependencies
-        run: python -m pip_audit -r requirements/ci-tools.txt --strict
+        run: |
+          status=1
+          for attempt in 1 2 3; do
+            if python -m pip_audit -r requirements/ci-tools.txt --strict; then
+              status=0
+              break
+            fi
+            status=$?
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 3))
+            fi
+          done
+          exit "$status"
 
       - name: Build twice and prove wheel reproducibility
         run: |
@@ -194,6 +206,9 @@ jobs:
 
       - name: Install package without dependencies
         run: python -m pip install --disable-pip-version-check --no-deps -e .
+
+      - name: Require native macOS Keychain Security.framework backend
+        run: python -c "from gpthands.credentials import CredentialStore; assert CredentialStore().backend() == 'macos-keychain'"
 
       - name: Real macOS sandbox isolation tests
         run: python -m unittest discover -s tests -p 'test_macos_sandbox_integration.py' -v
