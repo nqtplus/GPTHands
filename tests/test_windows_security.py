@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 import platform
+import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
-from gpthands.sandbox import SandboxRunner
+from gpthands.sandbox import SandboxError, SandboxRunner
 from gpthands.windows_classic import WindowsAppContainerSandbox
 from gpthands.windows_sandbox import build_sandbox_spec
 
@@ -39,7 +41,7 @@ class WindowsAppContainerIntegrationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def run_sandbox(self, command: list[str], *, allow_write: bool = False, allow_network: bool = False):
+    def run_sandbox(self, command: list[str], *, allow_write: bool = False, allow_network: bool = False, timeout: int = 10):
         return self.runner.run(
             command=command,
             workspace=self.workspace,
@@ -47,13 +49,13 @@ class WindowsAppContainerIntegrationTests(unittest.TestCase):
             allow_write=allow_write,
             allow_network=allow_network,
             env=self.env,
-            timeout=10,
+            timeout=timeout,
             max_output_bytes=100_000,
         )
 
-    def test_backend_is_real_appcontainer_and_captures_output(self) -> None:
+    def test_backend_is_real_appcontainer_job_and_captures_output(self) -> None:
         completed, backend = self.run_sandbox(["cmd.exe", "/d", "/c", "echo GPTHANDS_APPCONTAINER_OK"])
-        self.assertTrue(backend.startswith("windows-appcontainer"), backend)
+        self.assertEqual(backend, "windows-appcontainer-classic-job", backend)
         self.assertEqual(completed.returncode, 0, completed.stdout.decode(errors="replace"))
         self.assertIn(b"GPTHANDS_APPCONTAINER_OK", completed.stdout)
 
@@ -83,15 +85,7 @@ class WindowsAppContainerIntegrationTests(unittest.TestCase):
 
     def test_network_is_denied_without_capability(self) -> None:
         completed, _ = self.run_sandbox(
-            [
-                "curl.exe",
-                "--connect-timeout", "2",
-                "--max-time", "3",
-                "--silent",
-                "--show-error",
-                "--head",
-                "https://1.1.1.1/",
-            ],
+            ["curl.exe", "--connect-timeout", "2", "--max-time", "3", "--silent", "--show-error", "--head", "https://1.1.1.1/"],
             allow_network=False,
         )
         self.assertNotEqual(completed.returncode, 0, "outbound network unexpectedly escaped AppContainer isolation")
@@ -108,6 +102,44 @@ class WindowsAppContainerIntegrationTests(unittest.TestCase):
             else:
                 os.environ[secret_name] = old
         self.assertNotIn(b"SHOULD_NOT_LEAK_9471", completed.stdout)
+
+    def test_job_object_kills_descendant_after_root_exits(self) -> None:
+        marker = self.workspace / "child-leak.txt"
+        child = 'Start-Sleep -Seconds 3; Set-Content -LiteralPath child-leak.txt -Value LEAK'
+        command = ["cmd.exe", "/d", "/c", f'start "" /b powershell.exe -NoProfile -NonInteractive -Command "{child}"']
+        completed, backend = self.run_sandbox(command, allow_write=True)
+        self.assertEqual(backend, "windows-appcontainer-classic-job")
+        self.assertEqual(completed.returncode, 0, completed.stdout.decode(errors="replace"))
+        time.sleep(4)
+        self.assertFalse(marker.exists(), "descendant escaped Job Object cleanup after root exit")
+
+    def test_timeout_terminates_job_process_tree(self) -> None:
+        marker = self.workspace / "timeout-child-leak.txt"
+        child = 'Start-Sleep -Seconds 3; Set-Content -LiteralPath timeout-child-leak.txt -Value LEAK'
+        command = [
+            "cmd.exe", "/d", "/c",
+            f'start "" /b powershell.exe -NoProfile -NonInteractive -Command "{child}" & ping 127.0.0.1 -n 30 >nul',
+        ]
+        with self.assertRaises(SandboxError):
+            self.run_sandbox(command, allow_write=True, timeout=1)
+        time.sleep(4)
+        self.assertFalse(marker.exists(), "descendant survived Job Object timeout termination")
+
+    def test_workspace_junction_escape_is_refused_before_execution(self) -> None:
+        outside_dir = self.base / "outside-dir"
+        outside_dir.mkdir()
+        (outside_dir / "secret.txt").write_text("JUNCTION_SECRET", encoding="utf-8")
+        junction = self.workspace / "escape"
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(outside_dir)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        if created.returncode != 0:
+            self.skipTest(f"runner cannot create junction: {created.stdout.decode(errors='replace')}")
+        with self.assertRaises(SandboxError):
+            self.run_sandbox(["cmd.exe", "/d", "/c", "echo SHOULD_NOT_RUN"])
 
 
 if __name__ == "__main__":
