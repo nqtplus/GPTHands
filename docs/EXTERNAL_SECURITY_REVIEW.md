@@ -26,11 +26,11 @@ external report + approved findings state
         v
 minimal stable-promotion commit
   - docs/reviews/v1.0.0.json
-  - package/server version metadata
+  - exact rcN -> stable version substitution
   - README/ROADMAP release-status text only
         |
         v
-release workflow verifies ancestry + changed-file allowlist
+release workflow verifies ancestry + diff + exact version-only changes
 ```
 
 The release workflow runs `scripts/verify_release_gate.py`. For a stable `X.Y.Z` version it requires:
@@ -40,6 +40,9 @@ The release workflow runs `scripts/verify_release_gate.py`. For a stable `X.Y.Z`
 - `reviewed_commit` is an ancestor of the stable release commit;
 - the post-review diff contains only the explicit stable-promotion allowlist;
 - the exact review metadata file is part of that promotion diff;
+- the reviewed baseline package version is a direct prerelease of the stable version, for example `1.0.0rc1` → `1.0.0`;
+- `pyproject.toml`, `src/gpthands/__init__.py` and `src/gpthands/stable_server.py` must all change and may differ from the reviewed baseline **only by the exact prerelease-to-stable version-string substitution**;
+- arbitrary code/dependency changes hidden inside an otherwise allowlisted version file are rejected;
 - `independent_reviewer_attested` is `true`;
 - `critical_open == 0` and `high_open == 0`;
 - `report_url` uses HTTPS;
@@ -72,6 +75,7 @@ Template: `docs/reviews/v1.0.0.example.json`.
 - `src/gpthands/release_gate.py`
 - `scripts/release_bootstrap.py`
 - `scripts/verify_release_gate.py`
+- `scripts/build_platform_bundles.py`
 - release/CI workflows and installer-bundle generation.
 
 ## Required attack themes
@@ -90,10 +94,10 @@ Template: `docs/reviews/v1.0.0.example.json`.
 12. local UI CSRF/clickjacking/remote bind/credential leakage;
 13. Secure MCP Tunnel profile secret leakage;
 14. audit-chain mutation/reordering/truncation limitations;
-15. installer symlink/path replacement, downgrade and rollback attacks;
+15. installer symlink/path replacement, wheel substitution, downgrade and rollback attacks;
 16. supply-chain/reproducibility/attestation weaknesses;
 17. MCP modern/legacy confusion that could affect authorization;
-18. stable-release review-gate bypass, reviewed-commit substitution or post-review code injection.
+18. stable-release review-gate bypass, reviewed-commit substitution, allowlisted-file code injection or post-review code injection.
 
 ## Reviewer acceptance gates
 
@@ -106,9 +110,12 @@ A stable v1 review should at minimum establish that:
 - credentials are not stored in plaintext by GPTHands;
 - approval tokens cannot be forged/reused for another workspace/action;
 - local UI cannot bind to non-loopback through user input;
-- package upgrade cannot silently replace a working release before smoke verification;
+- package upgrade cannot silently replace a working release before digest + smoke verification;
+- packaged install requires a trusted expected wheel SHA-256 and refuses same-version digest substitution;
+- rollback requires a previously recorded digest binding plus a matching local release marker and smoke check;
+- embedded bundle digest is understood as bundle-to-wheel consistency, not authentication of a maliciously replaced entire ZIP;
 - rollback selects a previously installed verified local release;
-- the stable promotion gate rejects unreviewed runtime/security changes after the reviewed baseline;
+- the stable promotion gate rejects unreviewed runtime/security changes after the reviewed baseline, including code hidden inside allowlisted version files;
 - known residual risks are accurately documented.
 
 ## Reproduction commands
@@ -120,7 +127,7 @@ python -m pip install 'hypothesis==6.165.10'
 python -m unittest discover -s tests -p 'test_properties.py' -v
 ```
 
-Platform CI additionally runs real bubblewrap, macOS Seatbelt and Windows AppContainer/Job Object integration tests. `tests/test_release_gate_git.py` creates a real temporary Git history to prove that a minimal reviewed promotion passes while a post-review runtime-code change is rejected.
+Platform CI additionally runs real bubblewrap, macOS Seatbelt and Windows AppContainer/Job Object integration tests. `tests/test_release_gate_git.py` creates a real temporary Git history to prove that a minimal reviewed promotion passes while both post-review runtime-code changes and code injection disguised as a version bump are rejected. Cross-platform installer smoke tests exercise digest-bound install → upgrade → rollback on Ubuntu, macOS and Windows.
 
 ## Expected review output
 
@@ -138,6 +145,10 @@ An independent reviewer should provide:
 After review completion, copy `docs/reviews/v1.0.0.example.json` to `docs/reviews/v1.0.0.json`, replace every placeholder with real review data, and make only the minimal stable-promotion changes allowed by the release gate.
 
 The repository should link the final report/advisory from this file and close Issue #1 before checking the `External security review` roadmap item.
+
+## Repository governance
+
+The connected GitHub API currently exposes no repository rulesets for this repository. Branch-protection details are not readable through the connector, so this document does not claim that branch protection is absent. As defense-in-depth, configure a GitHub ruleset/branch policy requiring the full CI workflow for protected release changes when repository settings support it. This does not replace independent review or the release workflow gate.
 
 ## Disclosure
 
