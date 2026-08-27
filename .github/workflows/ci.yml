@@ -34,7 +34,7 @@ jobs:
       - name: Compile
         run: python -m compileall -q src tests scripts
 
-      - name: Security regression and deterministic fuzz suite
+      - name: Security regression, MCP compatibility and deterministic fuzz suite
         run: python -m unittest discover -s tests -v
 
   adversarial-properties:
@@ -102,14 +102,14 @@ jobs:
           bom = json.loads(Path('dist/gpthands.cdx.json').read_text())
           assert bom['bomFormat'] == 'CycloneDX'
           assert bom['specVersion'] == '1.6'
-          assert bom['metadata']['component']['version'] == '0.4.0'
+          assert bom['metadata']['component']['version'] == '1.0.0'
           assert Path('dist/SHA256SUMS').stat().st_size > 0
           PY
 
       - name: Upload verified supply-chain artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: gpthands-v0.4-supply-chain
+          name: gpthands-v1.0-supply-chain
           path: dist/
           if-no-files-found: error
           retention-days: 14
@@ -185,10 +185,10 @@ jobs:
       - name: Install package without dependencies
         run: python -m pip install --disable-pip-version-check --no-deps -e .
 
-      - name: Require native AppContainer SandboxEngine
+      - name: Require stable classic AppContainer backend
         shell: pwsh
         run: |
-          python -c "from gpthands.windows_sandbox import WindowsAppContainerSandbox; assert WindowsAppContainerSandbox.available(), 'native AppContainer backend unavailable'"
+          python -c "from gpthands.windows_classic import WindowsAppContainerSandbox; s=WindowsAppContainerSandbox(); assert s._classic_available, 'stable classic AppContainer backend unavailable'"
 
-      - name: Real Windows AppContainer isolation tests
+      - name: Real Windows AppContainer Job Object and reparse isolation tests
         run: python -m unittest discover -s tests -p 'test_windows_security.py' -v
