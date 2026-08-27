@@ -60,8 +60,13 @@ jobs:
       - name: Install package without dependencies
         run: python -m pip install --disable-pip-version-check --no-deps -e .
 
-      - name: Real bubblewrap isolation tests
+      - name: Unprivileged sandbox must enforce or fail closed
         run: python -m unittest discover -s tests -p 'test_sandbox_integration.py' -v
+
+      - name: Privileged CI probe must exercise real bubblewrap isolation
+        run: |
+          PYTHON_BIN="$(command -v python)"
+          sudo env "PATH=$PATH" GPTHANDS_BWRAP_STRICT=1 "$PYTHON_BIN" -m unittest discover -s tests -p 'test_sandbox_integration.py' -v
 
   macos-sandbox-integration:
     runs-on: macos-15
@@ -78,7 +83,7 @@ jobs:
           cache: ""
 
       - name: Require sandbox-exec backend
-        run: test -x /usr/bin/sandbox-exec && /usr/bin/sandbox-exec -h >/dev/null 2>&1 || true
+        run: test -x /usr/bin/sandbox-exec
 
       - name: Install package without dependencies
         run: python -m pip install --disable-pip-version-check --no-deps -e .
