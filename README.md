@@ -2,6 +2,8 @@
 
 **Secure-by-default local coding hands for ChatGPT and MCP clients.**
 
+[![CI](https://github.com/nqtplus/GPTHands/actions/workflows/ci.yml/badge.svg)](https://github.com/nqtplus/GPTHands/actions/workflows/ci.yml)
+
 GPTHands is a local MCP tool server that lets an AI assistant inspect and work with a selected repository while keeping authority outside the model.
 
 > The model proposes actions. GPTHands policy decides what is allowed.
@@ -11,12 +13,16 @@ GPTHands is a local MCP tool server that lets an AI assistant inspect and work w
 - Read-only by default
 - Workspace jail with canonical-path and symlink checks
 - Secret-file denylist (`.env`, keys, SSH/AWS/GCloud credentials, etc.)
+- Policy authority file protected from MCP reads/writes
+- Policy file ownership/permission checks on POSIX
 - No `shell=True`; commands are executable + argument arrays
-- Command allowlist and dangerous argument detection
+- Command allowlist, network-subcommand gate, and dangerous argument detection
 - Write and process execution disabled unless explicitly enabled
-- Network-capable commands denied by default
+- Network-capable commands denied by default at policy level
+- Child processes receive a minimal environment instead of host secrets
 - Output secret redaction
-- JSONL audit log for every tool call
+- Audit log forced outside the workspace, no symlink, mode `0600` on POSIX
+- Write content is fingerprinted in audit logs rather than stored verbatim
 - No third-party runtime dependency in v0.1
 
 ## Architecture
@@ -38,12 +44,11 @@ ChatGPT / MCP client
 +----+----------+----+
      |          |
      v          v
- Filesystem   Process
-  sandbox      sandbox
+ Guarded FS   Process policy
      |          |
      +-----+----+
            v
-      Workspace jail
+      Workspace root
 ```
 
 ## v0.1 tools
@@ -69,18 +74,22 @@ gpthands --workspace .
 
 GPTHands speaks newline-delimited MCP JSON-RPC over stdio.
 
-To enable controlled write/process capabilities, create `.gpthands.json` from `.gpthands.example.json` in the workspace and explicitly opt in.
+To enable controlled write/process capabilities, copy `.gpthands.example.json` to `.gpthands.json` in the target workspace, keep that policy file owner-controlled, and explicitly opt in. `.gpthands.json` is gitignored and GPTHands tools cannot read or modify it.
 
 ## Safety model
 
-GPTHands treats repository content, prompts, README files, and tool outputs as **untrusted data**. None of them can grant capabilities. Permission comes only from local policy.
+GPTHands treats repository content, prompts, README files, AGENTS files, build output, and tool output as **untrusted data**. None of them can grant capabilities. Permission comes only from local policy loaded at server startup.
 
-See [SECURITY.md](SECURITY.md) and [THREAT_MODEL.md](THREAT_MODEL.md).
+### Important v0.1 boundary
+
+`run_command` is policy-controlled but **not yet an OS-level process sandbox**. Enabling a general-purpose interpreter or untrusted build system may still let that process access host resources available to the local OS user or reach the network indirectly. Keep process execution disabled on sensitive hosts until v0.2 OS isolation is available.
+
+See [SECURITY.md](SECURITY.md), [THREAT_MODEL.md](THREAT_MODEL.md), and [ROADMAP.md](ROADMAP.md).
 
 ## Status
 
-`v0.1` is an initial security-first implementation. It is intentionally conservative. OS-level isolation (Seatbelt/bubblewrap/container profiles), approval UI, secure tunnel packaging, and signed releases are planned next.
+`v0.1` is a working security-first MCP core with automated security regression tests on Python 3.11–3.14. OS-level isolation (Linux namespaces/bubblewrap, macOS isolation strategy), human approval tokens, secure tunnel packaging, signed releases, and SBOM are next.
 
 ## License
 
-Apache-2.0 (planned license file before first tagged release).
+Apache-2.0. See [LICENSE](LICENSE).
