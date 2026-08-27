@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -11,14 +12,17 @@ from pathlib import Path
 
 from .approval import ApprovalError, ApprovalManager
 from .audit import AuditLogger, verify_audit_file
-from .limits import V03GPTHandsServer
+from .control_ui import serve_control_ui
+from .credentials import CredentialStore, CredentialStoreError
+from .diagnostics import diagnostic_json
+from .installer import InstallError, UserInstaller
 from .policy import POLICY_SCHEMA_VERSION, Policy, PolicyError, default_policy_path, migrate_policy_data
 from .risk import RiskLevel
 from .server import serve_stdio
-
-
-def state_root() -> Path:
-    return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "gpthands"
+from .state import state_root
+from .trust import TrustError, WorkspaceTrustStore
+from .tunnel import TunnelError, build_tunnel_plan, execute_tunnel_step
+from .ux_server import V04GPTHandsServer
 
 
 def default_audit_path() -> Path:
@@ -70,20 +74,25 @@ def _lease_iso(seconds: int) -> str:
     return datetime.fromtimestamp(time.time() + seconds, tz=timezone.utc).isoformat()
 
 
+def _workspace_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--workspace", type=Path, default=Path.cwd())
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GPTHands secure local MCP bridge")
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     serve = sub.add_parser("serve", help="serve MCP over stdio")
-    serve.add_argument("--workspace", type=Path, default=Path.cwd())
+    _workspace_arg(serve)
     serve.add_argument("--policy", type=Path)
     serve.add_argument("--audit-log", type=Path, default=default_audit_path())
+    serve.add_argument("--allow-untrusted", action="store_true", help="explicit compatibility override; not recommended")
 
     path = sub.add_parser("policy-path", help="print the external policy path")
-    path.add_argument("--workspace", type=Path, default=Path.cwd())
+    _workspace_arg(path)
 
     init = sub.add_parser("init-policy", help="create a lease-bound external policy")
-    init.add_argument("--workspace", type=Path, default=Path.cwd())
+    _workspace_arg(init)
     init.add_argument("--lease-seconds", type=int, default=900)
     init.add_argument("--allow-write", action="store_true")
     init.add_argument("--allow-process", action="store_true")
@@ -96,64 +105,166 @@ def _build_parser() -> argparse.ArgumentParser:
     init.add_argument("--max-queue-seconds", type=int, default=2)
 
     migrate = sub.add_parser("migrate-policy", help="rewrite a supported historical policy to the current schema")
-    migrate.add_argument("--workspace", type=Path, default=Path.cwd())
+    _workspace_arg(migrate)
     migrate.add_argument("--policy", type=Path)
 
     approve = sub.add_parser("approve", help="issue a short-lived one-time human approval token")
-    approve.add_argument("--workspace", type=Path, default=Path.cwd())
+    _workspace_arg(approve)
     approve.add_argument("--risk", required=True, choices=[r.name for r in RiskLevel])
     approve.add_argument("--seconds", type=int, default=300)
     approve.add_argument("--action-hash")
 
     audit = sub.add_parser("audit-verify", help="verify the tamper-evident audit chain")
     audit.add_argument("--audit-log", type=Path, default=default_audit_path())
+
+    trust = sub.add_parser("trust", help="explicitly trust one canonical workspace")
+    _workspace_arg(trust)
+    trust.add_argument("--label")
+    untrust = sub.add_parser("untrust", help="remove workspace trust")
+    _workspace_arg(untrust)
+    sub.add_parser("trust-list", help="list explicitly trusted workspaces")
+
+    cred_backend = sub.add_parser("credential-backend", help="show the OS credential-store backend")
+    cred_set = sub.add_parser("credential-set", help="store a secret in the OS credential store")
+    cred_set.add_argument("name")
+    cred_set.add_argument("--stdin", action="store_true", help="read the secret from stdin")
+    cred_del = sub.add_parser("credential-delete", help="delete a secret from the OS credential store")
+    cred_del.add_argument("name")
+
+    doctor = sub.add_parser("doctor", help="run local health and security diagnostics")
+    _workspace_arg(doctor)
+
+    ui = sub.add_parser("ui", help="start loopback-only local status/config UI")
+    _workspace_arg(ui)
+    ui.add_argument("--port", type=int, default=0)
+    ui.add_argument("--no-browser", action="store_true")
+
+    for name, help_text in (
+        ("tunnel-plan", "print a Secure MCP Tunnel setup plan"),
+        ("tunnel-init", "create/update a tunnel-client profile via the official client"),
+        ("tunnel-doctor", "run official tunnel-client doctor"),
+        ("tunnel-run", "run the official Secure MCP Tunnel client"),
+    ):
+        p = sub.add_parser(name, help=help_text)
+        _workspace_arg(p)
+        p.add_argument("--tunnel-id", required=True)
+        p.add_argument("--profile", default="gpthands")
+        p.add_argument("--tunnel-client")
+        if name != "tunnel-plan":
+            p.add_argument("--credential-name", help="OS credential-store entry injected as CONTROL_PLANE_API_KEY")
+
+    install = sub.add_parser("install-user", help="install local GPTHands UX launchers with rollback metadata")
+    install.add_argument("--bin-dir", type=Path)
+    uninstall = sub.add_parser("uninstall-user", help="remove GPTHands UX launchers and restore backups")
+    uninstall.add_argument("--bin-dir", type=Path)
     return parser
+
+
+def _tunnel_plan_from_args(args):
+    return build_tunnel_plan(
+        workspace=args.workspace,
+        tunnel_id=args.tunnel_id,
+        profile=args.profile,
+        binary=args.tunnel_client,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     args_in = list(sys.argv[1:] if argv is None else argv)
-    known = {"serve", "policy-path", "init-policy", "migrate-policy", "approve", "audit-verify"}
+    known = {
+        "serve", "policy-path", "init-policy", "migrate-policy", "approve", "audit-verify",
+        "trust", "untrust", "trust-list", "credential-backend", "credential-set", "credential-delete",
+        "doctor", "ui", "tunnel-plan", "tunnel-init", "tunnel-doctor", "tunnel-run",
+        "install-user", "uninstall-user",
+    }
     if not args_in or args_in[0] not in known:
         args_in.insert(0, "serve")
     args = _build_parser().parse_args(args_in)
 
-    if args.subcommand == "policy-path":
-        try:
+    try:
+        if args.subcommand == "policy-path":
             print(default_policy_path(args.workspace.resolve(strict=True)))
-        except OSError as exc:
-            print(f"policy-path failed: {exc}", file=sys.stderr)
-            return 2
-        return 0
+            return 0
 
-    if args.subcommand == "audit-verify":
-        result = verify_audit_file(args.audit_log)
-        print(json.dumps({
-            "valid": result.valid,
-            "anchored": result.anchored,
-            "chained_records": result.chained_records,
-            "legacy_records": result.legacy_records,
-            "last_hash": result.last_hash,
-            "error": result.error,
-        }, indent=2))
-        return 0 if result.valid else 2
+        if args.subcommand == "audit-verify":
+            result = verify_audit_file(args.audit_log)
+            print(json.dumps({
+                "valid": result.valid,
+                "anchored": result.anchored,
+                "chained_records": result.chained_records,
+                "legacy_records": result.legacy_records,
+                "last_hash": result.last_hash,
+                "error": result.error,
+            }, indent=2))
+            return 0 if result.valid else 2
 
-    if args.subcommand == "init-policy":
-        if not 1 <= args.lease_seconds <= 86_400:
-            print("lease-seconds must be between 1 and 86400", file=sys.stderr)
-            return 2
-        if args.allow_network and not args.allow_process:
-            print("--allow-network requires --allow-process", file=sys.stderr)
-            return 2
-        if not 1 <= args.max_requests_per_minute <= 6000:
-            print("max-requests-per-minute must be between 1 and 6000", file=sys.stderr)
-            return 2
-        if not 1 <= args.max_concurrent_actions <= 64:
-            print("max-concurrent-actions must be between 1 and 64", file=sys.stderr)
-            return 2
-        if not 0 <= args.max_queue_seconds <= 30:
-            print("max-queue-seconds must be between 0 and 30", file=sys.stderr)
-            return 2
-        try:
+        if args.subcommand == "trust":
+            record = WorkspaceTrustStore().trust(args.workspace, label=args.label)
+            print(json.dumps(record, indent=2, ensure_ascii=False))
+            return 0
+        if args.subcommand == "untrust":
+            print("removed" if WorkspaceTrustStore().untrust(args.workspace) else "not-trusted")
+            return 0
+        if args.subcommand == "trust-list":
+            print(json.dumps(WorkspaceTrustStore().list(), indent=2, ensure_ascii=False))
+            return 0
+
+        if args.subcommand == "credential-backend":
+            print(CredentialStore().backend())
+            return 0
+        if args.subcommand == "credential-set":
+            value = sys.stdin.read().rstrip("\r\n") if args.stdin else getpass.getpass("Secret: ")
+            CredentialStore().set(args.name, value)
+            print("stored")
+            return 0
+        if args.subcommand == "credential-delete":
+            print("deleted" if CredentialStore().delete(args.name) else "not-found")
+            return 0
+
+        if args.subcommand == "doctor":
+            print(diagnostic_json(args.workspace))
+            return 0
+        if args.subcommand == "ui":
+            return serve_control_ui(args.workspace, port=args.port, open_browser=not args.no_browser)
+
+        if args.subcommand.startswith("tunnel-"):
+            plan = _tunnel_plan_from_args(args)
+            if args.subcommand == "tunnel-plan":
+                print(json.dumps({
+                    "profile": plan.profile,
+                    "init": plan.init_argv,
+                    "doctor": plan.doctor_argv,
+                    "run": plan.run_argv,
+                    "secret_model": "CONTROL_PLANE_API_KEY is an env reference; literal keys are not written to the profile",
+                }, indent=2))
+                return 0
+            argv = {
+                "tunnel-init": plan.init_argv,
+                "tunnel-doctor": plan.doctor_argv,
+                "tunnel-run": plan.run_argv,
+            }[args.subcommand]
+            completed = execute_tunnel_step(argv, credential_name=args.credential_name, timeout=120 if args.subcommand == "tunnel-run" else 60)
+            sys.stdout.write(completed.stdout)
+            return completed.returncode
+
+        if args.subcommand == "install-user":
+            print(json.dumps(UserInstaller(bin_dir=args.bin_dir).install(), indent=2))
+            return 0
+        if args.subcommand == "uninstall-user":
+            print(json.dumps(UserInstaller(bin_dir=args.bin_dir).uninstall(), indent=2))
+            return 0
+
+        if args.subcommand == "init-policy":
+            if not 1 <= args.lease_seconds <= 86_400:
+                raise ValueError("lease-seconds must be between 1 and 86400")
+            if args.allow_network and not args.allow_process:
+                raise ValueError("--allow-network requires --allow-process")
+            if not 1 <= args.max_requests_per_minute <= 6000:
+                raise ValueError("max-requests-per-minute must be between 1 and 6000")
+            if not 1 <= args.max_concurrent_actions <= 64:
+                raise ValueError("max-concurrent-actions must be between 1 and 64")
+            if not 0 <= args.max_queue_seconds <= 30:
+                raise ValueError("max-queue-seconds must be between 0 and 30")
             workspace = args.workspace.resolve(strict=True)
             expiry = _lease_iso(args.lease_seconds)
             data = {
@@ -174,13 +285,9 @@ def main(argv: list[str] | None = None) -> int:
             target = default_policy_path(workspace)
             _secure_write_policy(target, data, workspace)
             print(target)
-        except (PolicyError, OSError) as exc:
-            print(f"init-policy refused: {exc}", file=sys.stderr)
-            return 2
-        return 0
+            return 0
 
-    if args.subcommand == "migrate-policy":
-        try:
+        if args.subcommand == "migrate-policy":
             workspace = args.workspace.resolve(strict=True)
             target = args.policy or default_policy_path(workspace)
             if not target.exists():
@@ -194,13 +301,9 @@ def main(argv: list[str] | None = None) -> int:
             _secure_write_policy(target, migrated, workspace)
             Policy.load(workspace, target)
             print(target)
-        except (PolicyError, OSError, json.JSONDecodeError) as exc:
-            print(f"migrate-policy refused: {exc}", file=sys.stderr)
-            return 2
-        return 0
+            return 0
 
-    if args.subcommand == "approve":
-        try:
+        if args.subcommand == "approve":
             workspace = args.workspace.resolve(strict=True)
             manager = ApprovalManager(default_approval_key_path())
             try:
@@ -213,30 +316,24 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 manager.close()
             print(token)
-        except (ApprovalError, ValueError, OSError) as exc:
-            print(f"approval refused: {exc}", file=sys.stderr)
-            return 2
-        return 0
+            return 0
 
-    approvals: ApprovalManager | None = None
-    audit: AuditLogger | None = None
-    try:
         workspace = args.workspace.resolve(strict=True)
+        if not args.allow_untrusted and not WorkspaceTrustStore().is_trusted(workspace):
+            print("GPTHands startup refused: workspace is not explicitly trusted; run `gpthands trust --workspace <path>` first", file=sys.stderr)
+            return 2
         policy = Policy.load(workspace, args.policy)
         audit = AuditLogger(args.audit_log, workspace=workspace)
         approvals = ApprovalManager(default_approval_key_path())
-    except (PolicyError, ApprovalError, OSError) as exc:
-        if audit is not None:
+        try:
+            return serve_stdio(V04GPTHandsServer(policy, audit, approvals=approvals))
+        finally:
             audit.close()
-        if approvals is not None:
             approvals.close()
-        print(f"GPTHands startup refused: {exc}", file=sys.stderr)
+
+    except (PolicyError, ApprovalError, CredentialStoreError, TrustError, TunnelError, InstallError, OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"GPTHands refused: {exc}", file=sys.stderr)
         return 2
-    try:
-        return serve_stdio(V03GPTHandsServer(policy, audit, approvals=approvals))
-    finally:
-        audit.close()
-        approvals.close()
 
 
 if __name__ == "__main__":
