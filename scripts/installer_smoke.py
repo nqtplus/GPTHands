@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP = ROOT / "scripts" / "release_bootstrap.py"
-CURRENT_VERSION = "1.0.0"
+CURRENT_VERSION = "1.0.0rc1"
 OLD_VERSION = "0.9.999"
 
 
@@ -77,7 +77,6 @@ def main() -> int:
         launcher = Path(final["launcher"])
         if not launcher.exists():
             raise RuntimeError("launcher was not created")
-        # Doctor does not require workspace trust and proves the switched release launches.
         if os.name == "nt":
             run("cmd.exe", "/d", "/c", str(launcher), "doctor", "--workspace", str(ROOT))
         else:
