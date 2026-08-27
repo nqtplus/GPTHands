@@ -5,6 +5,7 @@ import os
 import platform
 import shutil
 import subprocess
+from pathlib import Path
 
 
 class CredentialStoreError(RuntimeError):
@@ -13,6 +14,8 @@ class CredentialStoreError(RuntimeError):
 
 SERVICE = "GPTHands"
 _ERR_SEC_ITEM_NOT_FOUND = -25300
+_MAX_SECRET_BYTES = 2560
+_SECRET_TOOL_TIMEOUT_SECONDS = 10
 
 
 def _name(value: str) -> str:
@@ -22,8 +25,30 @@ def _name(value: str) -> str:
     return value
 
 
+def _secret_bytes(secret: str) -> bytes:
+    if not isinstance(secret, str) or not secret or "\x00" in secret:
+        raise CredentialStoreError("credential value is invalid")
+    encoded = secret.encode("utf-8")
+    if len(encoded) > _MAX_SECRET_BYTES:
+        raise CredentialStoreError(f"credential exceeds {_MAX_SECRET_BYTES}-byte portable limit")
+    return encoded
+
+
 class CredentialStore:
     """OS-backed secret storage. There is intentionally no plaintext fallback."""
+
+    @staticmethod
+    def _linux_tool() -> str:
+        candidate = shutil.which("secret-tool")
+        if not candidate:
+            raise CredentialStoreError("Secret Service helper `secret-tool` is unavailable")
+        try:
+            path = Path(candidate).expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise CredentialStoreError("Secret Service helper cannot be resolved safely") from exc
+        if not path.is_file():
+            raise CredentialStoreError("Secret Service helper is not a regular file")
+        return str(path)
 
     def backend(self) -> str:
         system = platform.system()
@@ -35,14 +60,14 @@ class CredentialStore:
             return "macos-keychain"
         if system == "Windows":
             return "windows-credential-manager"
-        if system == "Linux" and shutil.which("secret-tool"):
+        if system == "Linux":
+            self._linux_tool()
             return "linux-secret-service"
         raise CredentialStoreError("no supported OS credential store is available")
 
     def set(self, name: str, secret: str) -> None:
         name = _name(name)
-        if not secret or "\x00" in secret:
-            raise CredentialStoreError("credential value is invalid")
+        _secret_bytes(secret)
         backend = self.backend()
         if backend == "macos-keychain":
             self._mac_set(name, secret)
@@ -150,7 +175,7 @@ class CredentialStore:
         # Do not invoke `/usr/bin/security -w <secret>`: that would expose the
         # secret in process argv. Keep password bytes inside this process and
         # pass them directly to Security.framework.
-        secret_bytes = secret.encode("utf-8")
+        secret_bytes = _secret_bytes(secret)
         secret_buffer = ctypes.create_string_buffer(secret_bytes)
         status, item, _length, _data, apis = cls._mac_find(name, include_password=False)
         security, core = apis
@@ -203,13 +228,17 @@ class CredentialStore:
                 raise CredentialStoreError("credential not found in Keychain")
             if status != 0:
                 raise CredentialStoreError(f"Keychain read failed with OSStatus {status}")
+            if password_length.value > _MAX_SECRET_BYTES:
+                raise CredentialStoreError("Keychain credential exceeds portable size limit")
             if password_length.value and not password_data.value:
                 raise CredentialStoreError("Keychain returned an invalid password buffer")
             raw = ctypes.string_at(password_data, password_length.value) if password_length.value else b""
             try:
-                return raw.decode("utf-8")
+                value = raw.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise CredentialStoreError("Keychain credential is not valid UTF-8") from exc
+            _secret_bytes(value)
+            return value
         finally:
             if password_data.value:
                 security.SecKeychainItemFreeContent(None, password_data)
@@ -235,39 +264,55 @@ class CredentialStore:
 
     @staticmethod
     def _linux_set(name: str, secret: str) -> None:
-        proc = subprocess.run(
-            ["secret-tool", "store", "--label", f"GPTHands {name}", "service", SERVICE, "name", name],
-            input=secret,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=False,
-        )
+        tool = CredentialStore._linux_tool()
+        try:
+            proc = subprocess.run(
+                [tool, "store", "--label", f"GPTHands {name}", "service", SERVICE, "name", name],
+                input=secret,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False,
+                timeout=_SECRET_TOOL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise CredentialStoreError("Secret Service write timed out") from exc
         if proc.returncode != 0:
             raise CredentialStoreError(f"Secret Service write failed: {proc.stderr.strip()[:300]}")
 
     @staticmethod
     def _linux_get(name: str) -> str:
-        proc = subprocess.run(
-            ["secret-tool", "lookup", "service", SERVICE, "name", name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=False,
-        )
-        value = proc.stdout.rstrip("\n")
+        tool = CredentialStore._linux_tool()
+        try:
+            proc = subprocess.run(
+                [tool, "lookup", "service", SERVICE, "name", name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False,
+                timeout=_SECRET_TOOL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise CredentialStoreError("Secret Service read timed out") from exc
+        value = proc.stdout.rstrip("\r\n")
         if proc.returncode != 0 or not value:
             raise CredentialStoreError("credential not found in Secret Service")
+        _secret_bytes(value)
         return value
 
     @staticmethod
     def _linux_delete(name: str) -> bool:
-        proc = subprocess.run(
-            ["secret-tool", "clear", "service", SERVICE, "name", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            shell=False,
-        )
+        tool = CredentialStore._linux_tool()
+        try:
+            proc = subprocess.run(
+                [tool, "clear", "service", SERVICE, "name", name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+                timeout=_SECRET_TOOL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise CredentialStoreError("Secret Service delete timed out") from exc
         return proc.returncode == 0
 
     @staticmethod
@@ -309,7 +354,7 @@ class CredentialStore:
 
     def _win_set(self, name: str, secret: str) -> None:
         advapi, Credential, cred_type, persist = self._win_api()
-        blob = secret.encode("utf-8")
+        blob = _secret_bytes(secret)
         buf = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
         cred = Credential()
         cred.Type = cred_type
@@ -328,8 +373,15 @@ class CredentialStore:
             raise CredentialStoreError("credential not found in Windows Credential Manager")
         try:
             cred = ptr.contents
+            if cred.CredentialBlobSize > _MAX_SECRET_BYTES:
+                raise CredentialStoreError("Windows credential exceeds portable size limit")
             data = ctypes.string_at(cred.CredentialBlob, cred.CredentialBlobSize)
-            return data.decode("utf-8")
+            try:
+                value = data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise CredentialStoreError("Windows credential is not valid UTF-8") from exc
+            _secret_bytes(value)
+            return value
         finally:
             advapi.CredFree(ptr)
 
