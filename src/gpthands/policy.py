@@ -29,6 +29,7 @@ _SECRET_NAMES = {
 }
 _SECRET_DIR_NAMES = {".ssh", ".aws", ".gnupg"}
 _PROTECTED_NAMES = {".gpthands.json", ".gpthands-policy.json"}
+_MAX_LEASE_SECONDS = 86_400
 
 
 def _workspace_id(workspace: Path) -> str:
@@ -64,15 +65,19 @@ def _parse_expiry(value: object, *, name: str) -> float | None:
     raise PolicyError(f"{name} must be an ISO-8601 timestamp or unix time")
 
 
+def _live(expiry: float | None) -> bool:
+    return expiry is not None and expiry > time.time()
+
+
 @dataclass(frozen=True)
 class Policy:
     workspace: Path
     policy_path: Path
-    allow_write: bool = False
-    allow_process: bool = False
-    allow_network_commands: bool = False
+    write_enabled: bool = False
+    process_enabled: bool = False
+    network_enabled: bool = False
     require_os_sandbox: bool = True
-    approval_required_from: RiskLevel = RiskLevel.NETWORK
+    approval_required_from: RiskLevel = RiskLevel.EXEC
     allowed_commands: tuple[str, ...] = field(default_factory=tuple)
     max_read_bytes: int = 1_000_000
     max_write_bytes: int = 1_000_000
@@ -82,26 +87,43 @@ class Policy:
     process_lease_until: float | None = None
     network_lease_until: float | None = None
 
+    @property
+    def allow_write(self) -> bool:
+        return self.write_enabled and _live(self.write_lease_until)
+
+    @property
+    def allow_process(self) -> bool:
+        return self.process_enabled and _live(self.process_lease_until)
+
+    @property
+    def allow_network_commands(self) -> bool:
+        return self.network_enabled and self.allow_process and _live(self.network_lease_until)
+
     @staticmethod
     def load(workspace: Path, policy_path: Path | None = None) -> "Policy":
         root = workspace.expanduser().resolve(strict=True)
         if not root.is_dir():
             raise PolicyError(f"workspace is not a directory: {root}")
 
-        path = (policy_path or default_policy_path(root)).expanduser().resolve(strict=False)
+        lexical = Path(os.path.abspath((policy_path or default_policy_path(root)).expanduser()))
+        if lexical.is_symlink():
+            raise PolicyError("policy file must not be a symlink")
+        resolved_parent = lexical.parent.resolve(strict=False)
+        path = resolved_parent / lexical.name
         if _inside(root, path):
             raise PolicyError("policy authority must live outside the workspace")
 
         raw: dict[str, object] = {}
         if path.exists():
-            if path.is_symlink():
-                raise PolicyError("policy file must not be a symlink")
             info = path.stat()
             if os.name != "nt":
                 if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
                     raise PolicyError("policy file permissions must be 0600")
                 if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
                     raise PolicyError("policy file must be owned by current user")
+                parent_info = path.parent.stat()
+                if parent_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    raise PolicyError("policy directory must not be group/world writable")
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
@@ -129,22 +151,15 @@ class Policy:
         write_exp = _parse_expiry(raw.get("write_lease_until"), name="write_lease_until")
         process_exp = _parse_expiry(raw.get("process_lease_until"), name="process_lease_until")
         network_exp = _parse_expiry(raw.get("network_lease_until"), name="network_lease_until")
+        for name, expiry in (
+            ("write_lease_until", write_exp),
+            ("process_lease_until", process_exp),
+            ("network_lease_until", network_exp),
+        ):
+            if expiry is not None and expiry > now + _MAX_LEASE_SECONDS + 1:
+                raise PolicyError(f"{name} cannot grant more than 24 hours of authority")
 
-        write_enabled = bool_value("allow_write", False)
-        process_enabled = bool_value("allow_process", False)
-        network_enabled = bool_value("allow_network_commands", False)
-
-        # Mutable capabilities are lease-bound in v0.2. Missing/expired lease => disabled.
-        effective_write = write_enabled and write_exp is not None and write_exp > now
-        effective_process = process_enabled and process_exp is not None and process_exp > now
-        effective_network = (
-            network_enabled
-            and effective_process
-            and network_exp is not None
-            and network_exp > now
-        )
-
-        approval_raw = raw.get("approval_required_from", "NETWORK")
+        approval_raw = raw.get("approval_required_from", "EXEC")
         if not isinstance(approval_raw, str):
             raise PolicyError("approval_required_from must be a risk level string")
         try:
@@ -155,9 +170,9 @@ class Policy:
         return Policy(
             workspace=root,
             policy_path=path,
-            allow_write=effective_write,
-            allow_process=effective_process,
-            allow_network_commands=effective_network,
+            write_enabled=bool_value("allow_write", False),
+            process_enabled=bool_value("allow_process", False),
+            network_enabled=bool_value("allow_network_commands", False),
             require_os_sandbox=bool_value("require_os_sandbox", True),
             approval_required_from=approval_level,
             allowed_commands=tuple(allowed),
