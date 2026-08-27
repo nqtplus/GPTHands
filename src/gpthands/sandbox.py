@@ -115,6 +115,17 @@ class SandboxRunner:
             except subprocess.TimeoutExpired as exc:
                 raise SandboxError(f"command exceeded {timeout}s timeout") from exc
 
+        if plan.backend == "bubblewrap" and completed.returncode != 0:
+            diagnostic = completed.stdout.decode("utf-8", errors="replace").strip()
+            # Bubblewrap setup failures happen before the target program starts.
+            # Treat them as a failed security boundary rather than as command output.
+            if diagnostic.startswith("bwrap:"):
+                if not allow_network and ("loopback" in diagnostic or "RTM_NEWADDR" in diagnostic):
+                    raise SandboxError(
+                        "Linux network namespace isolation is unavailable on this host; refusing to run the target process with network denied"
+                    )
+                raise SandboxError(f"bubblewrap sandbox setup failed: {diagnostic[:500]}")
+
         if len(completed.stdout) > max_output_bytes:
             completed.stdout = completed.stdout[:max_output_bytes] + b"\n[output truncated by GPTHands policy]"
         return completed, plan.backend
@@ -133,17 +144,19 @@ class SandboxRunner:
             bwrap,
             "--die-with-parent",
             "--new-session",
-            "--unshare-all",
-            # UID/GID 0 exists only inside the new user namespace and maps back to
-            # the invoking host user. It supplies namespace-local capabilities
-            # needed to configure loopback in an isolated network namespace.
+            "--unshare-user",
+            "--unshare-ipc",
+            "--unshare-pid",
+            "--unshare-uts",
+            # UID/GID 0 is only inside the new user namespace and maps to the
+            # invoking host user; it does not grant host root authority.
             "--uid",
             "0",
             "--gid",
             "0",
         ]
-        if allow_network:
-            args.append("--share-net")
+        if not allow_network:
+            args.append("--unshare-net")
 
         for system_path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"):
             if Path(system_path).exists():
@@ -173,16 +186,38 @@ class SandboxRunner:
             "(deny default)",
             "(allow process-exec)",
             "(allow process-fork)",
+            "(allow process-info* (target same-sandbox))",
+            "(allow signal (target same-sandbox))",
+            "(allow mach-priv-task-port (target same-sandbox))",
             "(allow sysctl-read)",
+            "(allow mach-host*)",
+            "(allow user-preference-read)",
+            "(allow iokit-open)",
+            "(allow ipc-posix-sem)",
+            "(allow ipc-posix-shm-read*)",
             "(allow file-read-metadata)",
+            "(allow file-ioctl)",
+            "(allow mach-lookup",
+            "  (global-name \"com.apple.logd\")",
+            "  (global-name \"com.apple.system.logger\")",
+            "  (global-name \"com.apple.system.notification_center\")",
+            "  (global-name \"com.apple.system.opendirectoryd.libinfo\")",
+            "  (global-name \"com.apple.SystemConfiguration.configd\")",
+            "  (global-name \"com.apple.distributed_notifications@Uv3\"))",
             "(allow file-read* (subpath \"/usr\"))",
             "(allow file-read* (subpath \"/bin\"))",
             "(allow file-read* (subpath \"/sbin\"))",
             "(allow file-read* (subpath \"/System\"))",
             "(allow file-read* (subpath \"/Library\"))",
+            "(allow file-read* (subpath \"/private/etc\"))",
+            "(allow file-read* (subpath \"/private/var/db\"))",
+            "(allow file-read* (literal \"/dev/random\"))",
+            "(allow file-read* (literal \"/dev/urandom\"))",
+            "(allow file-write* (literal \"/dev/null\"))",
+            "(allow file-write* (literal \"/dev/zero\"))",
             f"(allow file-read* (subpath {q(workspace)}))",
             f"(allow file-read* file-write* (subpath {q(isolated_home)}))",
-            "(allow file-write* (subpath \"/private/tmp\"))",
+            "(allow file-read* file-write* (subpath \"/private/tmp\"))",
         ]
         if allow_write:
             lines.append(f"(allow file-write* (subpath {q(workspace)}))")
