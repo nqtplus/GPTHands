@@ -30,6 +30,21 @@ _DANGEROUS_ARG_PATTERNS = (
     re.compile(r"(^|\s)rm\s+-[^\s]*r"),
 )
 
+_ARBITRARY_CODE_PROGRAMS = {
+    "bash",
+    "sh",
+    "zsh",
+    "fish",
+    "python",
+    "python3",
+    "node",
+    "ruby",
+    "perl",
+    "php",
+    "pwsh",
+    "powershell",
+}
+
 _NETWORK_PROGRAMS = {
     "curl",
     "wget",
@@ -60,6 +75,8 @@ def classify_command(argv: Iterable[str]) -> RiskLevel:
         return RiskLevel.EXEC
     program = Path(args[0]).name.lower()
     joined = " ".join(args).lower()
+    if program in _ARBITRARY_CODE_PROGRAMS:
+        return RiskLevel.DESTRUCTIVE
     if any(pattern.search(joined) for pattern in _DANGEROUS_ARG_PATTERNS):
         return RiskLevel.DESTRUCTIVE
     if program in _NETWORK_PROGRAMS:
