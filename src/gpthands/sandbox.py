@@ -134,6 +134,13 @@ class SandboxRunner:
             "--die-with-parent",
             "--new-session",
             "--unshare-all",
+            # UID/GID 0 exists only inside the new user namespace and maps back to
+            # the invoking host user. It supplies namespace-local capabilities
+            # needed to configure loopback in an isolated network namespace.
+            "--uid",
+            "0",
+            "--gid",
+            "0",
         ]
         if allow_network:
             args.append("--share-net")
