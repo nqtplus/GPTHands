@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .locking import FileLock, LockError
 from .risk import RiskLevel
 
 
@@ -43,14 +44,36 @@ class ApprovalManager:
         self.used_path = (used_path or lexical.with_name("approval-used.jsonl")).expanduser()
         if self.used_path.is_symlink():
             raise ApprovalError("approval replay store must not be a symlink")
-        self._key = self._load_or_create_key()
-        self._consumed = self._load_consumed()
+        try:
+            self._key_lock = FileLock(self.key_path.with_name(self.key_path.name + ".lock"))
+            self._used_lock = FileLock(self.used_path.with_name(self.used_path.name + ".lock"))
+            with self._key_lock:
+                self._key = self._load_or_create_key_unlocked()
+            with self._used_lock:
+                self._consumed = self._load_consumed_unlocked()
+        except LockError as exc:
+            raise ApprovalError(str(exc)) from exc
 
-    def _load_or_create_key(self) -> bytes:
+    def close(self) -> None:
+        for name in ("_key_lock", "_used_lock"):
+            lock = getattr(self, name, None)
+            if lock is not None:
+                lock.close()
+                setattr(self, name, None)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except OSError:
+            pass
+
+    def _load_or_create_key_unlocked(self) -> bytes:
         if self.key_path.is_symlink():
             raise ApprovalError("approval key must not be a symlink")
         if self.key_path.exists():
             info = self.key_path.stat()
+            if not stat.S_ISREG(info.st_mode):
+                raise ApprovalError("approval key must be a regular file")
             if os.name != "nt":
                 if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
                     raise ApprovalError("approval key permissions must be 0600")
@@ -62,6 +85,8 @@ class ApprovalManager:
             return data
 
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         fd = os.open(self.key_path, flags, 0o600)
@@ -73,36 +98,73 @@ class ApprovalManager:
             os.close(fd)
         return data
 
-    def _load_consumed(self) -> set[str]:
+    def _validate_used_store_unlocked(self) -> None:
+        if self.used_path.is_symlink():
+            raise ApprovalError("approval replay store must not be a symlink")
+        if not self.used_path.exists():
+            return
+        info = self.used_path.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ApprovalError("approval replay store must be a regular file")
+        if os.name != "nt":
+            if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                raise ApprovalError("approval replay store permissions must be 0600")
+            if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+                raise ApprovalError("approval replay store must be owned by current user")
+
+    def _load_consumed_unlocked(self) -> set[str]:
+        self._validate_used_store_unlocked()
         if not self.used_path.exists():
             return set()
-        info = self.used_path.stat()
-        if os.name != "nt" and info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-            raise ApprovalError("approval replay store permissions must be 0600")
         consumed: set[str] = set()
         try:
             for line in self.used_path.read_text(encoding="utf-8").splitlines():
-                if line:
-                    consumed.add(line.strip())
+                value = line.strip()
+                if value:
+                    consumed.add(value)
         except OSError as exc:
             raise ApprovalError(f"cannot read approval replay store: {exc}") from exc
         return consumed
 
-    def _mark_consumed(self, nonce: str) -> None:
-        flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(self.used_path, flags, 0o600)
+    def _is_consumed(self, nonce: str) -> bool:
         try:
-            if os.name != "nt":
-                os.fchmod(fd, 0o600)
-            os.write(fd, (nonce + "\n").encode("ascii"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        self._consumed.add(nonce)
+            with self._used_lock:
+                current = self._load_consumed_unlocked()
+                self._consumed = current
+                return nonce in current
+        except LockError as exc:
+            raise ApprovalError(str(exc)) from exc
+
+    def _consume_nonce(self, nonce: str) -> None:
+        try:
+            with self._used_lock:
+                current = self._load_consumed_unlocked()
+                if nonce in current:
+                    self._consumed = current
+                    raise ApprovalError("approval token was already used")
+
+                flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND
+                if hasattr(os, "O_CLOEXEC"):
+                    flags |= os.O_CLOEXEC
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                fd = os.open(self.used_path, flags, 0o600)
+                try:
+                    info = os.fstat(fd)
+                    if not stat.S_ISREG(info.st_mode):
+                        raise ApprovalError("approval replay store must be a regular file")
+                    if os.name != "nt":
+                        os.fchmod(fd, 0o600)
+                        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+                            raise ApprovalError("approval replay store must be owned by current user")
+                    os.write(fd, (nonce + "\n").encode("ascii"))
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                current.add(nonce)
+                self._consumed = current
+        except LockError as exc:
+            raise ApprovalError(str(exc)) from exc
 
     def issue(
         self,
@@ -167,8 +229,10 @@ class ApprovalManager:
             raise ApprovalError("approval token is bound to another action")
 
         nonce = str(payload.get("nonce", ""))
-        if not nonce or nonce in self._consumed:
-            raise ApprovalError("approval token was already used")
+        if not nonce:
+            raise ApprovalError("approval token nonce is invalid")
         if consume:
-            self._mark_consumed(nonce)
+            self._consume_nonce(nonce)
+        elif self._is_consumed(nonce):
+            raise ApprovalError("approval token was already used")
         return payload
