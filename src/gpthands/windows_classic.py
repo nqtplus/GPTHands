@@ -4,6 +4,7 @@ import ctypes
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from . import windows_sandbox as ws
@@ -37,6 +38,8 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
     ) -> ws.WindowsSandboxResult:
         if not self._classic_available:
             raise ws.WindowsSandboxError("stable classic Windows AppContainer backend is unavailable")
+        if max_output_bytes < 1:
+            raise ws.WindowsSandboxError("max_output_bytes must be positive")
         try:
             assert_no_reparse_tree(workspace)
         except WindowsPathError as exc:
@@ -99,7 +102,14 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
         cls._icacls(scratch, "/grant", f"*{sid_text}:(OI)(CI)M", "/T", "/C", "/Q")
         cls._icacls(scratch, "/setintegritylevel", "(OI)(CI)L", "/T", "/C", "/Q")
 
-    def _wait_in_job(self, info: ws.PROCESS_INFORMATION, timeout: int) -> int:
+    def _wait_in_job(
+        self,
+        info: ws.PROCESS_INFORMATION,
+        timeout: int,
+        *,
+        output_path: Path,
+        max_output_bytes: int,
+    ) -> int:
         self._kernel32.ResumeThread.restype = ws.wintypes.DWORD
         self._kernel32.ResumeThread.argtypes = [ws.wintypes.HANDLE]
         job: WindowsJobObject | None = None
@@ -110,14 +120,37 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
             if resume == 0xFFFFFFFF:
                 raise ws.WindowsSandboxError(f"ResumeThread failed: {ctypes.get_last_error()}")
 
-            wait = self._kernel32.WaitForSingleObject(info.hProcess, max(1, timeout) * 1000)
-            if wait == ws._WAIT_TIMEOUT:
-                job.terminate(124)
-                self._kernel32.WaitForSingleObject(info.hProcess, 5000)
-                raise ws.WindowsSandboxError(f"command exceeded {timeout}s timeout; Windows Job Object terminated the process tree")
-            if wait != ws._WAIT_OBJECT_0:
+            deadline = time.monotonic() + max(1, timeout)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    job.terminate(124)
+                    self._kernel32.WaitForSingleObject(info.hProcess, 5000)
+                    raise ws.WindowsSandboxError(
+                        f"command exceeded {timeout}s timeout; Windows Job Object terminated the process tree"
+                    )
+
+                wait_ms = min(25, max(1, int(remaining * 1000)))
+                wait = self._kernel32.WaitForSingleObject(info.hProcess, wait_ms)
+
+                try:
+                    output_size = output_path.stat().st_size
+                except FileNotFoundError:
+                    output_size = 0
+                if output_size > max_output_bytes:
+                    job.terminate(126)
+                    self._kernel32.WaitForSingleObject(info.hProcess, 5000)
+                    raise ws.WindowsSandboxError(
+                        f"command exceeded {max_output_bytes} byte output limit; Windows Job Object terminated the process tree"
+                    )
+
+                if wait == ws._WAIT_OBJECT_0:
+                    break
+                if wait == ws._WAIT_TIMEOUT:
+                    continue
                 job.terminate(125)
                 raise ws.WindowsSandboxError(f"WaitForSingleObject failed: {ctypes.get_last_error()}")
+
             exit_code = ws.wintypes.DWORD()
             if not self._kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(exit_code)):
                 raise ws.WindowsSandboxError(f"GetExitCodeProcess failed: {ctypes.get_last_error()}")
@@ -234,7 +267,12 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
                 if not ok:
                     raise ws.WindowsSandboxError(f"classic AppContainer CreateProcessW failed: {ctypes.get_last_error()}")
                 try:
-                    returncode = self._wait_in_job(info, timeout)
+                    returncode = self._wait_in_job(
+                        info,
+                        timeout,
+                        output_path=output_path,
+                        max_output_bytes=max_output_bytes,
+                    )
                 finally:
                     self._kernel32.CloseHandle(info.hThread)
                     self._kernel32.CloseHandle(info.hProcess)
