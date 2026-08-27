@@ -43,6 +43,10 @@ _ARBITRARY_CODE_PROGRAMS = {
     "php",
     "pwsh",
     "powershell",
+    "cmd",
+    "wscript",
+    "cscript",
+    "mshta",
 }
 
 _NETWORK_PROGRAMS = {
@@ -55,6 +59,7 @@ _NETWORK_PROGRAMS = {
     "sftp",
     "ftp",
     "telnet",
+    "gh",
 }
 
 _NETWORK_SUBCOMMANDS = {
@@ -68,19 +73,38 @@ _NETWORK_SUBCOMMANDS = {
     "go": {"get", "install"},
 }
 
+_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat", ".com")
+
+
+def normalized_program(value: str) -> str:
+    name = Path(value).name.lower()
+    for suffix in _EXECUTABLE_SUFFIXES:
+        if name.endswith(suffix) and len(name) > len(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def command_requires_network(argv: Iterable[str]) -> bool:
+    args = list(argv)
+    if not args:
+        return False
+    program = normalized_program(args[0])
+    if program in _NETWORK_PROGRAMS:
+        return True
+    network_subcommands = _NETWORK_SUBCOMMANDS.get(program, set())
+    return any(arg.lower() in network_subcommands for arg in args[1:])
+
 
 def classify_command(argv: Iterable[str]) -> RiskLevel:
     args = list(argv)
     if not args:
         return RiskLevel.EXEC
-    program = Path(args[0]).name.lower()
+    program = normalized_program(args[0])
     joined = " ".join(args).lower()
     if program in _ARBITRARY_CODE_PROGRAMS:
         return RiskLevel.DESTRUCTIVE
     if any(pattern.search(joined) for pattern in _DANGEROUS_ARG_PATTERNS):
         return RiskLevel.DESTRUCTIVE
-    if program in _NETWORK_PROGRAMS:
-        return RiskLevel.NETWORK
-    if len(args) > 1 and args[1].lower() in _NETWORK_SUBCOMMANDS.get(program, set()):
+    if command_requires_network(args):
         return RiskLevel.NETWORK
     return RiskLevel.EXEC
