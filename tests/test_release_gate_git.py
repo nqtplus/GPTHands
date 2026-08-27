@@ -55,15 +55,18 @@ class StableReleaseGitIntegrationTests(unittest.TestCase):
             self.fail(f"git {' '.join(args)} failed:\n{completed.stdout}")
         return completed.stdout
 
-    def _promote(self) -> str:
+    def _promote(self, *, poison_version_file: bool = False) -> str:
         (self.root / "pyproject.toml").write_text(
             '[project]\nname = "gpthands"\nversion = "1.0.0"\n', encoding="utf-8"
         )
         (self.root / "src" / "gpthands" / "__init__.py").write_text(
             '__version__ = "1.0.0"\n', encoding="utf-8"
         )
+        stable_text = 'VERSION = "1.0.0"\n'
+        if poison_version_file:
+            stable_text += 'UNREVIEWED_CODE = "should block stable release"\n'
         (self.root / "src" / "gpthands" / "stable_server.py").write_text(
-            'VERSION = "1.0.0"\n', encoding="utf-8"
+            stable_text, encoding="utf-8"
         )
         review = {
             "schema_version": 1,
@@ -115,6 +118,13 @@ class StableReleaseGitIntegrationTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 2, completed.stdout)
         self.assertIn("unreviewed files", completed.stdout)
         self.assertIn("src/gpthands/policy.py", completed.stdout)
+
+    def test_unreviewed_code_hidden_in_version_file_blocks_release(self) -> None:
+        stable = self._promote(poison_version_file=True)
+        completed = self._gate(stable)
+        self.assertEqual(completed.returncode, 2, completed.stdout)
+        self.assertIn("changes beyond exact", completed.stdout)
+        self.assertIn("stable_server.py", completed.stdout)
 
 
 if __name__ == "__main__":
