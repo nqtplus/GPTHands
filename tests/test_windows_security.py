@@ -10,6 +10,7 @@ from pathlib import Path
 
 from gpthands.sandbox import SandboxError, SandboxRunner
 from gpthands.windows_classic import WindowsAppContainerSandbox
+from gpthands.windows_job import WindowsJobObject
 from gpthands.windows_sandbox import build_sandbox_spec
 
 
@@ -22,6 +23,45 @@ class WindowsSpecTests(unittest.TestCase):
             self.assertIn(b"0.1.0", blob)
             self.assertIn(str(root).encode(), blob)
             self.assertNotIn(b"internetClient", blob)
+
+
+@unittest.skipUnless(platform.system() == "Windows", "Windows-only Job Object integration")
+class WindowsJobObjectIntegrationTests(unittest.TestCase):
+    def test_kill_on_close_terminates_inherited_descendant_after_root_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            started = base / "child-started.txt"
+            leaked = base / "child-survived.txt"
+            child = (
+                f"Set-Content -LiteralPath {str(started)!r} -Value STARTED; "
+                f"Start-Sleep -Seconds 3; Set-Content -LiteralPath {str(leaked)!r} -Value LEAK"
+            )
+            root = (
+                "Start-Sleep -Milliseconds 1000; "
+                f"Start-Process powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-Command',{child!r}); "
+                "Start-Sleep -Milliseconds 750; exit 0"
+            )
+            process = subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", root],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+            )
+            job = WindowsJobObject.create(max_processes=8)
+            try:
+                job.assign(int(process._handle))  # type: ignore[attr-defined]
+                self.assertEqual(process.wait(timeout=8), 0)
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and not started.exists():
+                    time.sleep(0.05)
+                self.assertTrue(started.exists(), "child did not start inside the inherited Job Object")
+            finally:
+                job.close()
+                if process.poll() is None:
+                    process.kill()
+            time.sleep(4)
+            self.assertFalse(leaked.exists(), "descendant survived JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE")
 
 
 @unittest.skipUnless(platform.system() == "Windows", "Windows-only AppContainer integration")
@@ -73,11 +113,9 @@ class WindowsAppContainerIntegrationTests(unittest.TestCase):
     def test_workspace_acl_is_read_only_then_explicitly_read_write(self) -> None:
         target = self.workspace / "created.txt"
         command = ["cmd.exe", "/d", "/c", "echo ALLOWED>created.txt"]
-
         completed, _ = self.run_sandbox(command, allow_write=False)
         self.assertNotEqual(completed.returncode, 0, "read-only AppContainer staging unexpectedly accepted a write")
         self.assertFalse(target.exists())
-
         completed, _ = self.run_sandbox(command, allow_write=True)
         self.assertEqual(completed.returncode, 0, completed.stdout.decode(errors="replace"))
         self.assertTrue(target.exists())
@@ -102,23 +140,6 @@ class WindowsAppContainerIntegrationTests(unittest.TestCase):
             else:
                 os.environ[secret_name] = old
         self.assertNotIn(b"SHOULD_NOT_LEAK_9471", completed.stdout)
-
-    def test_job_object_kills_descendant_after_root_exits(self) -> None:
-        marker = self.workspace / "child-leak.txt"
-        child = 'Start-Sleep -Seconds 3; Set-Content -LiteralPath child-leak.txt -Value LEAK'
-        root = (
-            "$p = Start-Process powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-Command',"
-            + repr(child)
-            + ") -PassThru; exit 0"
-        )
-        completed, backend = self.run_sandbox(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", root],
-            allow_write=True,
-        )
-        self.assertEqual(backend, "windows-appcontainer-classic-job")
-        self.assertEqual(completed.returncode, 0, completed.stdout.decode(errors="replace"))
-        time.sleep(4)
-        self.assertFalse(marker.exists(), "descendant escaped Job Object cleanup after root exit")
 
     def test_timeout_terminates_job_process_tree(self) -> None:
         marker = self.workspace / "timeout-child-leak.txt"
