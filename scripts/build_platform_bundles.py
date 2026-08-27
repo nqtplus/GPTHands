@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import time
 import zipfile
@@ -26,7 +27,7 @@ def _add_bytes(archive: zipfile.ZipFile, name: str, data: bytes, *, executable: 
 
 def _readme(platform_name: str, wheel_name: str) -> str:
     runner = "install.ps1" if platform_name == "windows" else "./install.sh"
-    return f"""GPTHands offline installer bundle\n\nPlatform: {platform_name}\nWheel: {wheel_name}\n\nInstall:\n  {runner}\n\nRollback:\n  python install.py rollback\n\nStatus:\n  python install.py status\n\nThe installer uses a versioned local virtual environment, no-index/no-deps wheel install, atomic launcher switching, and preserves prior versions for rollback. Python 3.11+ is required.\n"""
+    return f"""GPTHands offline installer bundle\n\nPlatform: {platform_name}\nWheel: {wheel_name}\n\nBefore running this bundle, verify the ZIP itself against the SHA256SUMS and GitHub/Sigstore attestation published on the trusted GPTHands release page. The embedded WHEEL.SHA256 then binds install.py to the exact wheel carried inside this bundle.\n\nInstall:\n  {runner}\n\nRollback:\n  python install.py rollback\n\nStatus:\n  python install.py status\n\nThe installer uses a versioned local virtual environment, no-index/no-deps wheel install, atomic launcher switching, per-version wheel digest binding, and preserves prior verified versions for rollback. Python 3.11+ is required.\n"""
 
 
 def build_bundle(*, wheel: Path, bootstrap: Path, outdir: Path, platform_name: str) -> Path:
@@ -34,22 +35,35 @@ def build_bundle(*, wheel: Path, bootstrap: Path, outdir: Path, platform_name: s
     outdir.mkdir(parents=True, exist_ok=True)
     output = outdir / f"gpthands-{version}-{platform_name}.zip"
     wheel_bytes = wheel.read_bytes()
+    wheel_digest = hashlib.sha256(wheel_bytes).hexdigest()
     bootstrap_bytes = bootstrap.read_bytes()
+    manifest = {
+        "schema": 1,
+        "name": "gpthands",
+        "version": version,
+        "platform": platform_name,
+        "wheel": wheel.name,
+        "wheel_sha256": wheel_digest,
+    }
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         _add_bytes(archive, wheel.name, wheel_bytes)
+        _add_bytes(archive, "WHEEL.SHA256", (wheel_digest + "\n").encode("ascii"))
+        _add_bytes(archive, "BUNDLE-MANIFEST.json", (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode("utf-8"))
         _add_bytes(archive, "install.py", bootstrap_bytes, executable=True)
         _add_bytes(archive, "README.txt", _readme(platform_name, wheel.name).encode("utf-8"))
         if platform_name == "windows":
             ps = (
                 "$ErrorActionPreference = 'Stop'\n"
                 "$Here = Split-Path -Parent $MyInvocation.MyCommand.Path\n"
-                f"python \"$Here\\install.py\" install \"$Here\\{wheel.name}\" @args\n"
+                "$Digest = (Get-Content -Raw \"$Here\\WHEEL.SHA256\").Trim()\n"
+                f"python \"$Here\\install.py\" install \"$Here\\{wheel.name}\" --sha256 $Digest @args\n"
             )
             _add_bytes(archive, "install.ps1", ps.encode("utf-8"))
         else:
             sh = (
                 "#!/bin/sh\nset -eu\nHERE=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n"
-                f"exec python3 \"$HERE/install.py\" install \"$HERE/{wheel.name}\" \"$@\"\n"
+                "DIGEST=$(tr -d '\\r\\n' < \"$HERE/WHEEL.SHA256\")\n"
+                f"exec python3 \"$HERE/install.py\" install \"$HERE/{wheel.name}\" --sha256 \"$DIGEST\" \"$@\"\n"
             )
             _add_bytes(archive, "install.sh", sh.encode("utf-8"), executable=True)
     return output
