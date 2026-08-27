@@ -47,7 +47,6 @@ class SandboxRunner:
                         cwd=cwd,
                         allow_write=allow_write,
                         allow_network=allow_network,
-                        isolated_home=isolated_home,
                     ),
                 )
         elif system == "darwin":
@@ -94,8 +93,12 @@ class SandboxRunner:
                 isolated_home=isolated_home,
             )
             proc_env = dict(env)
-            proc_env["HOME"] = str(isolated_home)
-            proc_env["TMPDIR"] = str(isolated_home)
+            if plan.backend == "bubblewrap":
+                proc_env["HOME"] = "/tmp/gpthands-home"
+                proc_env["TMPDIR"] = "/tmp"
+            else:
+                proc_env["HOME"] = str(isolated_home)
+                proc_env["TMPDIR"] = str(isolated_home)
             try:
                 completed = subprocess.run(
                     plan.argv,
@@ -125,7 +128,6 @@ class SandboxRunner:
         cwd: Path,
         allow_write: bool,
         allow_network: bool,
-        isolated_home: Path,
     ) -> list[str]:
         args = [
             bwrap,
@@ -140,8 +142,8 @@ class SandboxRunner:
             if Path(system_path).exists():
                 args += ["--ro-bind", system_path, system_path]
         args += ["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
-        args += ["--dir", "/home", "--bind", str(isolated_home), str(isolated_home)]
-        args += ["--setenv", "HOME", str(isolated_home), "--setenv", "TMPDIR", "/tmp"]
+        args += ["--dir", "/tmp/gpthands-home"]
+        args += ["--setenv", "HOME", "/tmp/gpthands-home", "--setenv", "TMPDIR", "/tmp"]
         args += ["--bind" if allow_write else "--ro-bind", str(workspace), str(workspace)]
         args += ["--chdir", str(cwd), "--"]
         args.extend(command)
