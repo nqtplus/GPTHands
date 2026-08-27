@@ -372,12 +372,15 @@ def main() -> int:
 
     try:
         policy = Policy.load(args.workspace)
-        audit = AuditLogger(args.audit_log)
+        audit = AuditLogger(args.audit_log, workspace=policy.workspace)
     except (PolicyError, OSError) as exc:
         print(f"GPTHands startup refused: {exc}", file=sys.stderr)
         return 2
 
-    return serve_stdio(GPTHandsServer(policy, audit))
+    try:
+        return serve_stdio(GPTHandsServer(policy, audit))
+    finally:
+        audit.close()
 
 
 if __name__ == "__main__":
