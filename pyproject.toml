@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpthands"
+version = "0.1.0"
+description = "Secure-by-default local MCP coding tools for ChatGPT and MCP clients"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "GPTHands contributors" }]
+dependencies = []
+
+[project.scripts]
+gpthands = "gpthands.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
