@@ -12,23 +12,62 @@ from . import windows_sandbox as ws
 class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
     """Windows backend with a hardened classic-AppContainer launch path.
 
-    `CreateProcessW` requires LOCALAPPDATA when it resolves the per-user
-    AppContainer profile. We copy only that required path plus GPTHands' small
-    allowlisted environment into the child block; arbitrary host environment
-    variables are never inherited.
+    The classic fallback never grants the AppContainer SID access to the real
+    repository. It stages the repository under a private root and applies a
+    read-only or read-write ACL to that staged tree according to the live lease.
+    A separate scratch directory remains writable for TEMP/HOME needs.
     """
 
     @staticmethod
-    def _classic_environment(env: dict[str, str], isolated_home: Path):
-        values = ws._safe_windows_env(env, isolated_home)
+    def _classic_environment(env: dict[str, str], scratch: Path):
+        values = ws._safe_windows_env(env, scratch)
         local_app_data = os.environ.get("LOCALAPPDATA")
         if not local_app_data:
             raise ws.WindowsSandboxError("LOCALAPPDATA is required to launch a classic Windows AppContainer")
+        # Required by CreateProcessW to resolve the AppContainer profile. Do not
+        # copy arbitrary host environment variables into the child.
         values["LOCALAPPDATA"] = local_app_data
         system_drive = os.environ.get("SystemDrive")
         if system_drive:
             values.setdefault("SystemDrive", system_drive)
         return ws._environment_block(values)
+
+    @staticmethod
+    def _icacls(path: Path, *args: str) -> None:
+        completed = subprocess.run(
+            ["icacls.exe", str(path), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            shell=False,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise ws.WindowsSandboxError(
+                f"icacls failed for {path}: {completed.stdout.decode(errors='replace')[:500]}"
+            )
+
+    @classmethod
+    def _grant_appcontainer_paths(
+        cls,
+        *,
+        root: Path,
+        staged: Path,
+        scratch: Path,
+        sid_text: str,
+        allow_write: bool,
+    ) -> None:
+        # Root: traverse only, no inheritable write grant.
+        cls._icacls(root, "/grant", f"*{sid_text}:(RX)", "/Q")
+        cls._icacls(root, "/setintegritylevel", "L", "/Q")
+
+        stage_rights = "M" if allow_write else "RX"
+        cls._icacls(staged, "/grant", f"*{sid_text}:(OI)(CI){stage_rights}", "/T", "/C", "/Q")
+        cls._icacls(staged, "/setintegritylevel", "(OI)(CI)L", "/T", "/C", "/Q")
+
+        # Child runtimes may need TEMP/HOME. Keep that writable surface separate
+        # from the staged source tree.
+        cls._icacls(scratch, "/grant", f"*{sid_text}:(OI)(CI)M", "/T", "/C", "/Q")
+        cls._icacls(scratch, "/setintegritylevel", "(OI)(CI)L", "/T", "/C", "/Q")
 
     def _run_classic(
         self,
@@ -49,11 +88,13 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
         cwd = cwd.resolve(strict=True)
         isolated_home = isolated_home.resolve(strict=True)
         staged = isolated_home / "workspace"
+        scratch = isolated_home / "scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
         shutil.copytree(workspace, staged, symlinks=True, dirs_exist_ok=True)
         staged_cwd = staged / cwd.relative_to(workspace)
 
         mapped = ws._map_workspace_args(command, workspace, staged)
-        proc_env = ws._safe_windows_env(env, isolated_home)
+        proc_env = ws._safe_windows_env(env, scratch)
         executable = ws._resolve_executable(mapped, proc_env)
         mapped[0] = str(executable)
 
@@ -66,7 +107,13 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
 
         try:
             sid, created = self._create_profile(identity)
-            self._grant_staging_access(isolated_home, self._sid_string(sid))
+            self._grant_appcontainer_paths(
+                root=isolated_home,
+                staged=staged,
+                scratch=scratch,
+                sid_text=self._sid_string(sid),
+                allow_write=allow_write,
+            )
             capability_array, allocations = self._capabilities(allow_network)
             capabilities = ws.SECURITY_CAPABILITIES(
                 sid,
@@ -81,9 +128,6 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
                 os.set_inheritable(output_handle.fileno(), True)
                 stdin_os = ws.wintypes.HANDLE(msvcrt.get_osfhandle(stdin_handle.fileno()))
                 output_os = ws.wintypes.HANDLE(msvcrt.get_osfhandle(output_handle.fileno()))
-                # PROC_THREAD_ATTRIBUTE_HANDLE_LIST must contain unique handles.
-                # stderr intentionally shares stdout, but the shared OS handle is
-                # listed only once in the inheritance allowlist.
                 handles = (ws.wintypes.HANDLE * 2)(stdin_os, output_os)
 
                 size = ctypes.c_size_t(0)
@@ -124,7 +168,7 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
                 startup.lpAttributeList = attribute_list
 
                 command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(mapped))
-                environment = self._classic_environment(env, isolated_home)
+                environment = self._classic_environment(env, scratch)
                 info = ws.PROCESS_INFORMATION()
                 ok = self._kernel32.CreateProcessW(
                     str(executable),
