@@ -5,7 +5,6 @@ import os
 import platform
 import shutil
 import subprocess
-from pathlib import Path
 
 
 class CredentialStoreError(RuntimeError):
@@ -13,6 +12,7 @@ class CredentialStoreError(RuntimeError):
 
 
 SERVICE = "GPTHands"
+_ERR_SEC_ITEM_NOT_FOUND = -25300
 
 
 def _name(value: str) -> str:
@@ -27,7 +27,11 @@ class CredentialStore:
 
     def backend(self) -> str:
         system = platform.system()
-        if system == "Darwin" and shutil.which("security"):
+        if system == "Darwin":
+            try:
+                self._mac_api()
+            except (OSError, AttributeError) as exc:
+                raise CredentialStoreError("macOS Security.framework Keychain API is unavailable") from exc
             return "macos-keychain"
         if system == "Windows":
             return "windows-credential-manager"
@@ -66,39 +70,168 @@ class CredentialStore:
         return self._linux_delete(name)
 
     @staticmethod
-    def _mac_set(name: str, secret: str) -> None:
-        proc = subprocess.run(
-            ["security", "add-generic-password", "-U", "-a", name, "-s", SERVICE, "-w", secret],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=False,
+    def _mac_api():
+        security = ctypes.CDLL(
+            "/System/Library/Frameworks/Security.framework/Security",
+            use_errno=True,
         )
-        if proc.returncode != 0:
-            raise CredentialStoreError(f"Keychain write failed: {proc.stderr.strip()[:300]}")
+        core = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+            use_errno=True,
+        )
+
+        security.SecKeychainFindGenericPassword.restype = ctypes.c_int32
+        security.SecKeychainFindGenericPassword.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_char_p,
+            ctypes.c_uint32,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        security.SecKeychainAddGenericPassword.restype = ctypes.c_int32
+        security.SecKeychainAddGenericPassword.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_char_p,
+            ctypes.c_uint32,
+            ctypes.c_char_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        security.SecKeychainItemModifyAttributesAndData.restype = ctypes.c_int32
+        security.SecKeychainItemModifyAttributesAndData.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        security.SecKeychainItemDelete.restype = ctypes.c_int32
+        security.SecKeychainItemDelete.argtypes = [ctypes.c_void_p]
+        security.SecKeychainItemFreeContent.restype = ctypes.c_int32
+        security.SecKeychainItemFreeContent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        core.CFRelease.restype = None
+        core.CFRelease.argtypes = [ctypes.c_void_p]
+        return security, core
 
     @staticmethod
-    def _mac_get(name: str) -> str:
-        proc = subprocess.run(
-            ["security", "find-generic-password", "-a", name, "-s", SERVICE, "-w"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=False,
-        )
-        if proc.returncode != 0:
-            raise CredentialStoreError("credential not found in Keychain")
-        return proc.stdout.rstrip("\n")
+    def _mac_strings(name: str) -> tuple[bytes, bytes]:
+        return SERVICE.encode("utf-8"), name.encode("utf-8")
 
-    @staticmethod
-    def _mac_delete(name: str) -> bool:
-        proc = subprocess.run(
-            ["security", "delete-generic-password", "-a", name, "-s", SERVICE],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            shell=False,
+    @classmethod
+    def _mac_find(
+        cls,
+        name: str,
+        *,
+        include_password: bool,
+    ) -> tuple[int, object, object, object, object]:
+        security, core = cls._mac_api()
+        service, account = cls._mac_strings(name)
+        item = ctypes.c_void_p()
+        password_length = ctypes.c_uint32()
+        password_data = ctypes.c_void_p()
+        status = security.SecKeychainFindGenericPassword(
+            None,
+            len(service),
+            service,
+            len(account),
+            account,
+            ctypes.byref(password_length) if include_password else None,
+            ctypes.byref(password_data) if include_password else None,
+            ctypes.byref(item),
         )
-        return proc.returncode == 0
+        return int(status), item, password_length, password_data, (security, core)
+
+    @classmethod
+    def _mac_set(cls, name: str, secret: str) -> None:
+        # Do not invoke `/usr/bin/security -w <secret>`: that would expose the
+        # secret in process argv. Keep password bytes inside this process and
+        # pass them directly to Security.framework.
+        secret_bytes = secret.encode("utf-8")
+        secret_buffer = ctypes.create_string_buffer(secret_bytes)
+        status, item, _length, _data, apis = cls._mac_find(name, include_password=False)
+        security, core = apis
+        try:
+            if status == 0 and item.value:
+                modified = security.SecKeychainItemModifyAttributesAndData(
+                    item,
+                    None,
+                    len(secret_bytes),
+                    ctypes.cast(secret_buffer, ctypes.c_void_p),
+                )
+                if modified != 0:
+                    raise CredentialStoreError(f"Keychain update failed with OSStatus {int(modified)}")
+                return
+            if status != _ERR_SEC_ITEM_NOT_FOUND:
+                raise CredentialStoreError(f"Keychain lookup failed with OSStatus {status}")
+
+            service, account = cls._mac_strings(name)
+            added_item = ctypes.c_void_p()
+            added = security.SecKeychainAddGenericPassword(
+                None,
+                len(service),
+                service,
+                len(account),
+                account,
+                len(secret_bytes),
+                ctypes.cast(secret_buffer, ctypes.c_void_p),
+                ctypes.byref(added_item),
+            )
+            if added != 0:
+                raise CredentialStoreError(f"Keychain write failed with OSStatus {int(added)}")
+            if added_item.value:
+                core.CFRelease(added_item)
+        finally:
+            if item.value:
+                core.CFRelease(item)
+            # Best-effort overwrite of our mutable local copy. Python/ctypes
+            # cannot guarantee erasure of every temporary immutable byte copy.
+            ctypes.memset(secret_buffer, 0, len(secret_buffer))
+
+    @classmethod
+    def _mac_get(cls, name: str) -> str:
+        status, item, password_length, password_data, apis = cls._mac_find(
+            name,
+            include_password=True,
+        )
+        security, core = apis
+        try:
+            if status == _ERR_SEC_ITEM_NOT_FOUND:
+                raise CredentialStoreError("credential not found in Keychain")
+            if status != 0:
+                raise CredentialStoreError(f"Keychain read failed with OSStatus {status}")
+            if password_length.value and not password_data.value:
+                raise CredentialStoreError("Keychain returned an invalid password buffer")
+            raw = ctypes.string_at(password_data, password_length.value) if password_length.value else b""
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise CredentialStoreError("Keychain credential is not valid UTF-8") from exc
+        finally:
+            if password_data.value:
+                security.SecKeychainItemFreeContent(None, password_data)
+            if item.value:
+                core.CFRelease(item)
+
+    @classmethod
+    def _mac_delete(cls, name: str) -> bool:
+        status, item, _length, _data, apis = cls._mac_find(name, include_password=False)
+        security, core = apis
+        try:
+            if status == _ERR_SEC_ITEM_NOT_FOUND:
+                return False
+            if status != 0 or not item.value:
+                raise CredentialStoreError(f"Keychain lookup failed with OSStatus {status}")
+            deleted = security.SecKeychainItemDelete(item)
+            if deleted != 0:
+                raise CredentialStoreError(f"Keychain delete failed with OSStatus {int(deleted)}")
+            return True
+        finally:
+            if item.value:
+                core.CFRelease(item)
 
     @staticmethod
     def _linux_set(name: str, secret: str) -> None:
