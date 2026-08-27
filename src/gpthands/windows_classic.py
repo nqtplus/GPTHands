@@ -7,16 +7,46 @@ import subprocess
 from pathlib import Path
 
 from . import windows_sandbox as ws
+from .windows_job import WindowsJobError, WindowsJobObject
+
+_CREATE_SUSPENDED = 0x00000004
 
 
 class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
-    """Windows backend with a hardened classic-AppContainer launch path.
+    """Stable Windows AppContainer backend with Job Object tree containment.
 
-    The classic fallback never grants the AppContainer SID access to the real
-    repository. It stages the repository under a private root and applies a
-    read-only or read-write ACL to that staged tree according to the live lease.
-    A separate scratch directory remains writable for TEMP/HOME needs.
+    v1 deliberately uses the classic AppContainer launch path because it lets
+    GPTHands create the process suspended, attach the process to an owner-side
+    Job Object, verify membership, and only then resume execution. This removes
+    the attach-after-start race and gives deterministic descendant cleanup.
     """
+
+    def run(
+        self,
+        *,
+        command: list[str],
+        workspace: Path,
+        cwd: Path,
+        allow_write: bool,
+        allow_network: bool,
+        isolated_home: Path,
+        env: dict[str, str],
+        timeout: int,
+        max_output_bytes: int,
+    ) -> ws.WindowsSandboxResult:
+        if not self._classic_available:
+            raise ws.WindowsSandboxError("stable classic Windows AppContainer backend is unavailable")
+        return self._run_classic(
+            command=command,
+            workspace=workspace,
+            cwd=cwd,
+            allow_write=allow_write,
+            allow_network=allow_network,
+            isolated_home=isolated_home,
+            env=env,
+            timeout=timeout,
+            max_output_bytes=max_output_bytes,
+        )
 
     @staticmethod
     def _classic_environment(env: dict[str, str], scratch: Path):
@@ -24,8 +54,6 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
         local_app_data = os.environ.get("LOCALAPPDATA")
         if not local_app_data:
             raise ws.WindowsSandboxError("LOCALAPPDATA is required to launch a classic Windows AppContainer")
-        # Required by CreateProcessW to resolve the AppContainer profile. Do not
-        # copy arbitrary host environment variables into the child.
         values["LOCALAPPDATA"] = local_app_data
         system_drive = os.environ.get("SystemDrive")
         if system_drive:
@@ -56,7 +84,6 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
         sid_text: str,
         allow_write: bool,
     ) -> None:
-        # Root: traverse only, no inheritable write grant.
         cls._icacls(root, "/grant", f"*{sid_text}:(RX)", "/Q")
         cls._icacls(root, "/setintegritylevel", "L", "/Q")
 
@@ -64,10 +91,39 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
         cls._icacls(staged, "/grant", f"*{sid_text}:(OI)(CI){stage_rights}", "/T", "/C", "/Q")
         cls._icacls(staged, "/setintegritylevel", "(OI)(CI)L", "/T", "/C", "/Q")
 
-        # Child runtimes may need TEMP/HOME. Keep that writable surface separate
-        # from the staged source tree.
         cls._icacls(scratch, "/grant", f"*{sid_text}:(OI)(CI)M", "/T", "/C", "/Q")
         cls._icacls(scratch, "/setintegritylevel", "(OI)(CI)L", "/T", "/C", "/Q")
+
+    def _wait_in_job(self, info: ws.PROCESS_INFORMATION, timeout: int) -> int:
+        self._kernel32.ResumeThread.restype = ws.wintypes.DWORD
+        self._kernel32.ResumeThread.argtypes = [ws.wintypes.HANDLE]
+        job: WindowsJobObject | None = None
+        try:
+            job = WindowsJobObject.create(max_processes=32)
+            job.assign(info.hProcess)
+            resume = self._kernel32.ResumeThread(info.hThread)
+            if resume == 0xFFFFFFFF:
+                raise ws.WindowsSandboxError(f"ResumeThread failed: {ctypes.get_last_error()}")
+
+            wait = self._kernel32.WaitForSingleObject(info.hProcess, max(1, timeout) * 1000)
+            if wait == ws._WAIT_TIMEOUT:
+                job.terminate(124)
+                self._kernel32.WaitForSingleObject(info.hProcess, 5000)
+                raise ws.WindowsSandboxError(f"command exceeded {timeout}s timeout; Windows Job Object terminated the process tree")
+            if wait != ws._WAIT_OBJECT_0:
+                job.terminate(125)
+                raise ws.WindowsSandboxError(f"WaitForSingleObject failed: {ctypes.get_last_error()}")
+            exit_code = ws.wintypes.DWORD()
+            if not self._kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(exit_code)):
+                raise ws.WindowsSandboxError(f"GetExitCodeProcess failed: {ctypes.get_last_error()}")
+            return int(exit_code.value)
+        except WindowsJobError as exc:
+            self._kernel32.TerminateProcess(info.hProcess, 125)
+            raise ws.WindowsSandboxError(str(exc)) from exc
+        finally:
+            if job is not None:
+                # KILL_ON_JOB_CLOSE cleans descendants even after the root exits.
+                job.close()
 
     def _run_classic(
         self,
@@ -139,23 +195,13 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
                 if not self._kernel32.InitializeProcThreadAttributeList(attribute_list, 2, 0, ctypes.byref(size)):
                     raise ws.WindowsSandboxError(f"InitializeProcThreadAttributeList failed: {ctypes.get_last_error()}")
                 if not self._kernel32.UpdateProcThreadAttribute(
-                    attribute_list,
-                    0,
-                    ws._PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-                    ctypes.byref(capabilities),
-                    ctypes.sizeof(capabilities),
-                    None,
-                    None,
+                    attribute_list, 0, ws._PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                    ctypes.byref(capabilities), ctypes.sizeof(capabilities), None, None,
                 ):
                     raise ws.WindowsSandboxError(f"security-capabilities attribute failed: {ctypes.get_last_error()}")
                 if not self._kernel32.UpdateProcThreadAttribute(
-                    attribute_list,
-                    0,
-                    ws._PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                    ctypes.cast(handles, ctypes.c_void_p),
-                    ctypes.sizeof(handles),
-                    None,
-                    None,
+                    attribute_list, 0, ws._PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    ctypes.cast(handles, ctypes.c_void_p), ctypes.sizeof(handles), None, None,
                 ):
                     raise ws.WindowsSandboxError(f"handle-list attribute failed: {ctypes.get_last_error()}")
 
@@ -171,21 +217,15 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
                 environment = self._classic_environment(env, scratch)
                 info = ws.PROCESS_INFORMATION()
                 ok = self._kernel32.CreateProcessW(
-                    str(executable),
-                    command_line,
-                    None,
-                    None,
-                    True,
-                    ws._CREATE_UNICODE_ENVIRONMENT | ws._CREATE_NO_WINDOW | ws._EXTENDED_STARTUPINFO_PRESENT,
-                    ctypes.cast(environment, ctypes.c_void_p),
-                    str(staged_cwd),
-                    ctypes.cast(ctypes.byref(startup), ctypes.POINTER(ws.STARTUPINFOW)),
-                    ctypes.byref(info),
+                    str(executable), command_line, None, None, True,
+                    ws._CREATE_UNICODE_ENVIRONMENT | ws._CREATE_NO_WINDOW | ws._EXTENDED_STARTUPINFO_PRESENT | _CREATE_SUSPENDED,
+                    ctypes.cast(environment, ctypes.c_void_p), str(staged_cwd),
+                    ctypes.cast(ctypes.byref(startup), ctypes.POINTER(ws.STARTUPINFOW)), ctypes.byref(info),
                 )
                 if not ok:
                     raise ws.WindowsSandboxError(f"classic AppContainer CreateProcessW failed: {ctypes.get_last_error()}")
                 try:
-                    returncode = self._wait_process(info, timeout)
+                    returncode = self._wait_in_job(info, timeout)
                 finally:
                     self._kernel32.CloseHandle(info.hThread)
                     self._kernel32.CloseHandle(info.hProcess)
@@ -193,7 +233,7 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
 
             if allow_write:
                 ws._sync_stage_back(staged, workspace)
-            return ws.WindowsSandboxResult(returncode, output, "windows-appcontainer-classic")
+            return ws.WindowsSandboxResult(returncode, output, "windows-appcontainer-classic-job")
         finally:
             if attribute_list is not None:
                 try:
