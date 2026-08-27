@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import io
 import json
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 
 from gpthands.audit import AuditLogger, redact_text
@@ -20,6 +18,9 @@ class PolicySecurityTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def write_policy(self, value: dict) -> None:
+        (self.root / ".gpthands.json").write_text(json.dumps(value), encoding="utf-8")
 
     def test_default_is_read_only_and_no_process(self) -> None:
         policy = Policy.load(self.root)
@@ -47,6 +48,12 @@ class PolicySecurityTests(unittest.TestCase):
                 with self.assertRaises(PolicyError):
                     policy.resolve_path(name)
 
+    def test_policy_authority_file_is_protected_from_tools(self) -> None:
+        self.write_policy({"allow_write": True})
+        policy = Policy.load(self.root)
+        with self.assertRaises(PolicyError):
+            policy.resolve_path(".gpthands.json", must_exist=True)
+
     @unittest.skipIf(os.name == "nt", "symlink permissions vary on Windows")
     def test_symlink_escape_is_denied(self) -> None:
         outside = self.root.parent / f"gpthands-outside-{os.getpid()}.txt"
@@ -68,21 +75,33 @@ class PolicySecurityTests(unittest.TestCase):
         with self.assertRaises(PolicyError):
             Policy.load(self.root)
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits only")
+    def test_config_must_not_be_group_or_world_writable(self) -> None:
+        config = self.root / ".gpthands.json"
+        config.write_text("{}", encoding="utf-8")
+        config.chmod(0o666)
+        try:
+            with self.assertRaises(PolicyError):
+                Policy.load(self.root)
+        finally:
+            config.chmod(0o600)
+
     def test_command_requires_explicit_allowlist(self) -> None:
-        (self.root / ".gpthands.json").write_text(
-            json.dumps({"allow_process": True, "allowed_commands": ["git"]}),
-            encoding="utf-8",
-        )
+        self.write_policy({"allow_process": True, "allowed_commands": ["git"]})
         policy = Policy.load(self.root)
         self.assertEqual(policy.validate_command(["git", "status"]), ["git", "status"])
         with self.assertRaises(PolicyError):
             policy.validate_command(["python3", "-c", "print(1)"])
 
+    def test_network_subcommand_is_denied_by_default(self) -> None:
+        self.write_policy({"allow_process": True, "allowed_commands": ["git"]})
+        policy = Policy.load(self.root)
+        self.assertEqual(policy.validate_command(["git", "status"]), ["git", "status"])
+        with self.assertRaises(PolicyError):
+            policy.validate_command(["git", "fetch"])
+
     def test_force_arguments_are_denied(self) -> None:
-        (self.root / ".gpthands.json").write_text(
-            json.dumps({"allow_process": True, "allowed_commands": ["git"]}),
-            encoding="utf-8",
-        )
+        self.write_policy({"allow_process": True, "allowed_commands": ["git"], "allow_network_commands": True})
         policy = Policy.load(self.root)
         with self.assertRaises(PolicyError):
             policy.validate_command(["git", "push", "--force"])
@@ -141,6 +160,30 @@ class ServerTests(unittest.TestCase):
         assert denied is not None
         self.assertTrue(denied["result"]["isError"])
         self.assertEqual((self.root / "existing.txt").read_text(encoding="utf-8"), "old")
+
+    def test_write_cannot_modify_policy_authority(self) -> None:
+        original = {"allow_write": True}
+        policy_path = self.root / ".gpthands.json"
+        policy_path.write_text(json.dumps(original), encoding="utf-8")
+        server = self.server()
+        response = server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "write_file",
+                    "arguments": {
+                        "target": ".gpthands.json",
+                        "content": json.dumps({"allow_process": True, "allowed_commands": ["python3"]}),
+                        "overwrite": True,
+                    },
+                },
+            }
+        )
+        assert response is not None
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(json.loads(policy_path.read_text(encoding="utf-8")), original)
 
     def test_initialize_and_tools_list(self) -> None:
         server = self.server()
