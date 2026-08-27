@@ -106,8 +106,15 @@ class WindowsAppContainerIntegrationTests(unittest.TestCase):
     def test_job_object_kills_descendant_after_root_exits(self) -> None:
         marker = self.workspace / "child-leak.txt"
         child = 'Start-Sleep -Seconds 3; Set-Content -LiteralPath child-leak.txt -Value LEAK'
-        command = ["cmd.exe", "/d", "/c", f'start "" /b powershell.exe -NoProfile -NonInteractive -Command "{child}"']
-        completed, backend = self.run_sandbox(command, allow_write=True)
+        root = (
+            "$p = Start-Process powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-Command',"
+            + repr(child)
+            + ") -PassThru; exit 0"
+        )
+        completed, backend = self.run_sandbox(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", root],
+            allow_write=True,
+        )
         self.assertEqual(backend, "windows-appcontainer-classic-job")
         self.assertEqual(completed.returncode, 0, completed.stdout.decode(errors="replace"))
         time.sleep(4)
