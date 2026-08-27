@@ -1,15 +1,19 @@
 {
-  "allow_write": true,
-  "allow_process": true,
+  "schema_version": 3,
+  "allow_write": false,
+  "allow_process": false,
   "allow_network_commands": false,
-  "write_lease_until": "2026-08-27T22:00:00+07:00",
-  "process_lease_until": "2026-08-27T22:00:00+07:00",
+  "write_lease_until": null,
+  "process_lease_until": null,
   "network_lease_until": null,
-  "allowed_commands": ["git", "python3"],
-  "approval_required_from": "NETWORK",
+  "allowed_commands": [],
+  "approval_required_from": "EXEC",
   "require_os_sandbox": true,
   "max_read_bytes": 1000000,
   "max_write_bytes": 1000000,
   "max_command_seconds": 30,
-  "max_output_bytes": 200000
+  "max_output_bytes": 200000,
+  "max_requests_per_minute": 120,
+  "max_concurrent_actions": 4,
+  "max_queue_seconds": 2
 }
