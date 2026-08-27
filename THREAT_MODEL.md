@@ -4,99 +4,111 @@
 
 Allow an AI client to perform useful local coding work while minimizing the authority granted to prompts, repository content, dependencies, generated commands, and compromised tools.
 
-GPTHands v0.2 assumes the model can be manipulated. Security decisions therefore live outside model reasoning.
+GPTHands v0.3 assumes the model can be manipulated. Security decisions therefore live outside model reasoning.
 
 ## Primary threats
 
 ### T1 — Prompt injection in repository content
-An instruction embedded in source, README, test output, or generated text asks the model to access secrets, alter policy, or run destructive commands.
+Repository instructions or tool output try to convince the model to access secrets, change policy, or run destructive commands.
 
-**v0.2 mitigation:** repository content cannot grant capabilities. Policy authority is outside the workspace, mutable authority expires, generic execution is risk-classified, and high-risk operations can require a human approval token.
+**Mitigation:** repository content cannot grant authority. External policy, leases, risk classification, human approval, and the OS sandbox are independent enforcement layers.
 
 ### T2 — Workspace escape
-A tool call attempts `../`, an absolute path, or a symlink to read/write outside the selected repository.
+A tool attempts traversal, an absolute path, or a symlink escape.
 
-**v0.2 mitigation:** reject absolute tool paths, canonicalize targets, verify workspace containment, test traversal/symlink escape, and mount only the workspace into the Linux process sandbox.
+**Mitigation:** absolute tool paths are rejected; targets are canonicalized and checked for workspace containment; secret paths are filtered; deterministic fuzz and Hypothesis path properties run in CI.
 
 ### T3 — Credential disclosure
-The agent reads `.env`, SSH/AWS/GCloud credentials, private keys, or hardcoded tokens and returns them to the model.
+The agent attempts to read credential files or inherit host secrets through environment variables.
 
-**v0.2 mitigation:** deny common credential paths, redact common token/key formats, do not inherit arbitrary host environment variables, isolate HOME, and constrain process filesystem visibility through the OS sandbox.
+**Mitigation:** common credential paths are denied, common token formats redacted, HOME/TMP isolated for child processes, arbitrary host environment variables are not forwarded, and supported OS sandboxes constrain filesystem visibility.
 
-### T4 — Destructive filesystem modification
-The model overwrites or destroys source unexpectedly.
+### T4 — Destructive modification
+The model overwrites source unexpectedly.
 
-**v0.2 mitigation:** write is disabled without a live lease; blind overwrite of an existing file is classified `DESTRUCTIVE`; `preview_edit` + `apply_edit` provides a diff/base hash/one-time preview id; Linux process workspace is read-only without a live write lease.
+**Mitigation:** live write lease required; overwrite is `DESTRUCTIVE`; `preview_edit`/`apply_edit` provides diff, base hash, and one-time preview id; process workspace is read-only without authorized write capability.
 
-### T5 — Arbitrary process/shell execution
-The model attempts pipes, command substitution, interpreters, or destructive commands.
+### T5 — Arbitrary code/process execution
+A command, interpreter, or build tool executes attacker-controlled code.
 
-**v0.2 mitigation:** GPTHands invokes argv directly with `shell=False`; generic executables require allowlisting and a process lease; interpreters/shells are classified `DESTRUCTIVE`; default policy requires approval from `EXEC`; OS sandboxing is required by default.
+**Mitigation:** process capability is off by default, executable allowlist applies, interpreters/shells are `DESTRUCTIVE`, approvals can be required from `EXEC`, argv uses `shell=False`, and OS sandboxing is required by default.
 
 ### T6 — Network exfiltration
-A process tries to send workspace data or discovered credentials to an external endpoint.
+A process sends workspace data or secrets to an external endpoint.
 
-**v0.2 mitigation:** Linux bubblewrap unshares network by default. Host network is shared only for an action classified `NETWORK` with a live network lease and applicable approval. Common network commands/subcommands are classified before execution. macOS profiles omit network permission unless explicitly granted.
+**Mitigation:** Linux network namespace is denied by default; macOS Seatbelt profile denies network unless granted; NETWORK actions require a live network lease and applicable approval. Unsupported secure backends fail closed.
 
 ### T7 — Environment-variable theft
-A child process prints API keys inherited from the parent.
+A child prints API keys inherited from the parent.
 
-**v0.2 mitigation:** child processes receive a minimal environment and isolated HOME/TMP; arbitrary host environment variables are not inherited.
+**Mitigation:** child environment is minimal and does not inherit arbitrary token/key variables.
 
-### T8 — Resource exhaustion
-A command hangs or emits unbounded output.
+### T8 — Resource exhaustion or request flooding
+A command hangs, emits unbounded output, or a client floods tool calls.
 
-**v0.2 mitigation:** command timeout, output cap, read/write byte caps, grep result/file caps, and sandbox process separation.
+**Mitigation:** process timeout/output caps, bounded filesystem/search operations, policy rate limit, maximum concurrent actions, and queue timeout.
 
-### T9 — Policy escalation
-Repository code modifies the authority file, or a symlink tricks GPTHands into loading policy from an attacker-controlled location.
+### T9 — Policy escalation or ambiguity
+Repository code modifies policy, a symlink redirects it, or a typo silently changes security behavior.
 
-**v0.2 mitigation:** authoritative policy lives outside the workspace, final policy symlinks are refused before canonicalization, POSIX ownership/permission checks are enforced, parent directory must not be group/world writable, and policy leases cannot exceed 24 hours.
+**Mitigation:** policy lives outside workspace, owner/permission/symlink checks apply, schema v3 rejects unknown fields and unsupported versions, numeric limits are bounded, and supported legacy schemas have explicit migration logic.
 
 ### T10 — Stale authority
-A server is started during a valid lease and remains privileged after the lease expires.
+A long-running server keeps permissions after a lease expires.
 
-**v0.2 mitigation:** write/process/network authority is calculated at action time, not cached at startup.
+**Mitigation:** write/process/network leases are evaluated at action time rather than cached at startup.
 
-### T11 — Approval replay/forgery
-A model reuses a human approval token or alters its risk/workspace/action.
+### T11 — Approval replay/forgery and multi-process races
+An attacker modifies a token, replays it after consumption, or races two GPTHands processes against the same nonce.
 
-**v0.2 mitigation:** HMAC signature, expiry, workspace binding, minimum-risk binding, optional exact-action binding, random nonce, and persistent consumed-nonce replay store outside the workspace.
+**Mitigation:** HMAC signature, expiry, workspace/risk/action binding, random nonce, owner-only replay state, and atomic check-and-consume under a cross-process file lock. CI races two processes and requires exactly one successful consumption.
 
 ### T12 — Audit tampering
-An agent modifies evidence of its own actions.
+An attacker edits, inserts, reorders, or removes evidence.
 
-**v0.2 mitigation:** audit log lives outside the workspace, refuses symlinks, is opened owner-only with no-follow semantics where available, and is not exposed by GPTHands filesystem tools.
+**Mitigation:** owner-only audit storage outside workspace, no-follow protections, cross-process append locking, SHA-256 previous-record chaining, full verification on startup, explicit `audit-verify`, and legacy-prefix anchoring.
 
-### T13 — Supply-chain execution during GPTHands install/runtime
-A dependency update compromises the local tool server.
+**Residual:** without an external checkpoint, truncating the newest tail can remove the final chain state without leaving a later contradictory link. Hash chaining is tamper-evident, not an external immutable ledger.
 
-**v0.2 mitigation:** GPTHands runtime has no third-party Python dependency. GitHub Actions dependencies are pinned by immutable commit SHA and CI credentials are not persisted after checkout.
+### T13 — Supply-chain compromise
+Build tooling, CI actions, or dependencies are compromised or replaced.
 
-## OS sandbox assumptions
+**Mitigation:** no third-party runtime Python dependency, pinned CI/release tools, immutable GitHub Action SHAs, `pip-audit`, reproducible wheel comparison, deterministic CycloneDX SBOM/checksums, and GitHub/Sigstore provenance/SBOM attestations. The attestation pipeline has been exercised successfully before tagged release use.
+
+### T14 — Parser/policy edge cases
+Malformed JSON-RPC shapes, unusual paths, malformed approvals, or strange policy values trigger unsafe exceptions or default-allow behavior.
+
+**Mitigation:** deterministic adversarial fuzz tests cover MCP shapes, paths, tokens, and policy parsing; Hypothesis property tests generate additional path/token cases; unknown policy fields fail closed.
+
+### T15 — Platform sandbox degradation
+An OS removes or changes the sandbox facility.
+
+**Mitigation:** `require_os_sandbox=true` refuses generic process execution when a supported backend is unavailable. Linux and macOS have real integration tests. Windows is explicitly fail-closed until a tested AppContainer backend exists. macOS successor and Windows staged-workspace designs are documented in `docs/PLATFORM_HARDENING.md`.
+
+## Platform assumptions
 
 ### Linux
 
-The strong process boundary assumes `bubblewrap` is installed and usable. If `require_os_sandbox=true` and the backend is unavailable, execution fails closed. CI installs bubblewrap and runs real isolation tests.
+The strong process boundary uses bubblewrap when usable. Hosted kernels that reject unprivileged namespace creation must fail closed; CI additionally uses a privileged probe to prove the real RO/RW mount and network-namespace rules.
 
 ### macOS
 
-The v0.2 strategy uses `sandbox-exec` when available. This facility is deprecated by Apple, so the project does not treat it as a permanent long-term boundary. Missing backend + `require_os_sandbox=true` means process execution is refused.
+The current compatibility boundary uses `sandbox-exec`/Seatbelt and is exercised on real macOS CI. Because Apple deprecated this public interface, a successor helper/VM-container strategy is required for durable support.
 
 ### Windows
 
-No OS sandbox backend is implemented in v0.2.
+No generic process OS sandbox is claimed in v0.3. Secure-default execution fails closed. The planned AppContainer backend uses a private staged workspace and Job Object constraints and must pass the acceptance tests in `docs/PLATFORM_HARDENING.md` before enablement.
 
 ## Known residual risks
 
 1. Secret detection/redaction is heuristic and incomplete.
-2. macOS needs a durable successor to deprecated `sandbox-exec`.
-3. Users can deliberately weaken security with `require_os_sandbox=false`.
-4. Multi-process races around replay-state consumption need stronger locking/transaction semantics in v0.3.
-5. Audit records are append-only but not yet cryptographically chained/tamper-evident.
-6. Transport security is external to the stdio server; MCP tunnel/auth configuration remains deployment responsibility.
-7. The risk classifier cannot semantically understand every tool. Strong isolation must not rely on classifier accuracy alone.
+2. macOS still needs an implemented durable successor to deprecated Seatbelt tooling.
+3. Windows AppContainer isolation is a design, not an implemented backend.
+4. Users can intentionally weaken the boundary with `require_os_sandbox=false`.
+5. Audit tail truncation needs external anchoring for strong detection.
+6. Transport/Tunnel authentication is outside the stdio server.
+7. Risk classification cannot infer arbitrary program semantics; isolation must not depend on classifier correctness alone.
 
-## Next hardening layer
+## Next layer
 
-v0.3 focuses on tamper-evident audit chaining, SBOM, signed/reproducible releases, dependency/vulnerability scanning, fuzzing/property-based adversarial tests, concurrency/rate limits, and Windows isolation design.
+v0.4 focuses on secure ChatGPT/MCP Tunnel UX, local diagnostics/configuration, keychain integration, approval UX, installers/rollback, workspace trust state, and the Windows AppContainer staged-workspace backend.
