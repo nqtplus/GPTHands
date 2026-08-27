@@ -220,5 +220,5 @@ jobs:
         run: |
           python -c "from gpthands.windows_classic import WindowsAppContainerSandbox; s=WindowsAppContainerSandbox(); assert s._classic_available, 'stable classic AppContainer backend unavailable'"
 
-      - name: Real Windows AppContainer Job Object and reparse isolation tests
-        run: python -m unittest discover -s tests -p 'test_windows_security.py' -v
+      - name: Real Windows AppContainer Job Object, reparse and output-quota isolation tests
+        run: python -m unittest discover -s tests -p 'test_windows*.py' -v
