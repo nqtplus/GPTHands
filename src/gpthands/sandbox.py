@@ -8,6 +8,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .windows_sandbox import WindowsAppContainerSandbox, WindowsSandboxError
+
 
 class SandboxError(RuntimeError):
     pass
@@ -63,10 +65,15 @@ class SandboxRunner:
                     argv=[sandbox_exec, "-p", profile, *command],
                     profile_text=profile,
                 )
+        elif system == "windows":
+            if WindowsAppContainerSandbox.available():
+                # Windows uses a native process-creation API rather than an
+                # argv wrapper. `run()` dispatches to it directly.
+                return SandboxPlan(backend="windows-appcontainer", argv=command)
 
         if self.require_os_sandbox:
             raise SandboxError(
-                "OS sandbox is required but unavailable; install bubblewrap on Linux or use a supported macOS sandbox-exec environment"
+                "OS sandbox is required but unavailable; install bubblewrap on Linux, use a supported macOS sandbox-exec environment, or use Windows 11 with the AppContainer SandboxEngine API"
             )
         return SandboxPlan(backend="policy-only", argv=command)
 
@@ -92,6 +99,30 @@ class SandboxRunner:
                 allow_network=allow_network,
                 isolated_home=isolated_home,
             )
+
+            if plan.backend == "windows-appcontainer":
+                try:
+                    result = WindowsAppContainerSandbox().run(
+                        command=command,
+                        workspace=workspace,
+                        cwd=cwd,
+                        allow_write=allow_write,
+                        allow_network=allow_network,
+                        isolated_home=isolated_home,
+                        env=env,
+                        timeout=timeout,
+                        max_output_bytes=max_output_bytes,
+                    )
+                except WindowsSandboxError as exc:
+                    raise SandboxError(str(exc)) from exc
+                completed = subprocess.CompletedProcess(
+                    args=command,
+                    returncode=result.returncode,
+                    stdout=result.output,
+                    stderr=None,
+                )
+                return completed, result.backend
+
             proc_env = dict(env)
             if plan.backend == "bubblewrap":
                 proc_env["HOME"] = "/tmp/gpthands-home"
@@ -150,13 +181,6 @@ class SandboxRunner:
             "--new-session",
             "--unshare-all",
         ]
-        # Do not force --uid/--gid remapping. Some hardened/containerized hosts
-        # allow bubblewrap mount namespaces but deny writing uid_map/gid_map.
-        # Bubblewrap's default user mapping preserves the invoking unprivileged
-        # identity and is sufficient for filesystem isolation.
-        #
-        # --unshare-all includes a network namespace. Sharing the host network
-        # back in is only allowed for explicitly network-authorized actions.
         if allow_network:
             args.append("--share-net")
 
@@ -186,9 +210,6 @@ class SandboxRunner:
         lines = [
             "(version 1)",
             "(deny default)",
-            # Apple's system baseline grants the minimum runtime services used
-            # by ordinary command-line processes. We keep our own filesystem
-            # and network grants narrow rather than using broad `allow default`.
             '(import "system.sb")',
             "(allow process-exec)",
             "(allow process-fork)",
@@ -230,7 +251,5 @@ class SandboxRunner:
         if allow_network:
             lines += ["(allow network-outbound)", "(allow network-inbound)"]
         else:
-            # Defense in depth in case the imported system baseline grants a
-            # narrow networking primitive on a future macOS release.
             lines.append("(deny network*)")
         return "\n".join(lines)
