@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 class ReleaseGateError(RuntimeError):
@@ -25,10 +25,32 @@ class ReleaseGateResult:
     reviewed_commit: str | None
     reviewer: str | None
     report_url: str | None
+    promotion_changed_files: tuple[str, ...] = ()
 
 
 def is_stable_version(version: str) -> bool:
     return bool(_STABLE_VERSION.fullmatch(version))
+
+
+def allowed_promotion_files(version: str) -> frozenset[str]:
+    """Files allowed to change after the independently reviewed RC baseline.
+
+    The stable promotion commit may carry review evidence, version metadata and
+    release-status documentation only. Security/runtime implementation changes
+    require a new external review baseline instead of being smuggled into the
+    promotion commit.
+    """
+
+    return frozenset(
+        {
+            f"docs/reviews/v{version}.json",
+            "pyproject.toml",
+            "src/gpthands/__init__.py",
+            "src/gpthands/stable_server.py",
+            "README.md",
+            "ROADMAP.md",
+        }
+    )
 
 
 def _require_string(data: dict[str, Any], key: str) -> str:
@@ -47,18 +69,39 @@ def _parse_completed_at(value: str) -> None:
         raise ReleaseGateError("review completed_at must include a timezone")
 
 
+def _normalize_changed_files(values: Iterable[str]) -> tuple[str, ...]:
+    normalized: set[str] = set()
+    for value in values:
+        item = str(value).replace("\\", "/").strip()
+        if not item:
+            continue
+        if item.startswith("/") or item.startswith("../") or "/../" in f"/{item}/":
+            raise ReleaseGateError(f"invalid promotion path: {value!r}")
+        normalized.add(item)
+    return tuple(sorted(normalized))
+
+
 def verify_release_gate(
     *,
     version: str,
     repository_root: Path,
     current_commit: str,
+    promotion_changed_files: Iterable[str] | None = None,
 ) -> ReleaseGateResult:
     """Verify the stable-release review gate.
 
     Pre-releases such as ``1.0.0rc1`` do not require an external-review record.
-    Stable ``X.Y.Z`` builds require ``docs/reviews/vX.Y.Z.json``. The record is
-    intentionally workflow evidence, not cryptographic proof that a reviewer is
-    independent; human/process review remains required.
+    Stable ``X.Y.Z`` builds require ``docs/reviews/vX.Y.Z.json``.
+
+    The review record points to the final independently reviewed RC baseline.
+    Because adding the review record and promoting ``rcN`` to a stable version
+    necessarily changes Git SHA, the stable release commit may differ from the
+    reviewed baseline *only* through a tiny allowlist of promotion metadata and
+    release-status documentation. Any runtime/security implementation change
+    after review blocks release and requires a new review baseline.
+
+    The record is workflow evidence, not cryptographic proof that the named
+    reviewer is independent; human/process verification remains required.
     """
 
     root = repository_root.resolve(strict=True)
@@ -119,10 +162,24 @@ def verify_release_gate(
     reviewed_commit = _require_string(data, "reviewed_commit")
     if not _SHA40.fullmatch(reviewed_commit):
         raise ReleaseGateError("reviewed_commit must be a lowercase 40-character Git SHA")
+
+    changed = _normalize_changed_files(promotion_changed_files or ())
     if reviewed_commit != current_commit:
-        raise ReleaseGateError(
-            "stable release commit differs from the externally reviewed commit; review the final commit before release"
-        )
+        if promotion_changed_files is None:
+            raise ReleaseGateError(
+                "release commit differs from reviewed baseline but promotion diff was not supplied"
+            )
+        permitted = allowed_promotion_files(version)
+        unexpected = set(changed) - permitted
+        if unexpected:
+            raise ReleaseGateError(
+                "stable promotion contains unreviewed files: " + ", ".join(sorted(unexpected))
+            )
+        expected_review_file = f"docs/reviews/v{version}.json"
+        if expected_review_file not in changed:
+            raise ReleaseGateError(
+                "stable promotion must add/update the exact external review metadata file"
+            )
 
     reviewer = _require_string(data, "reviewer")
     if data.get("independent_reviewer_attested") is not True:
@@ -154,4 +211,5 @@ def verify_release_gate(
         reviewed_commit=reviewed_commit,
         reviewer=reviewer,
         report_url=report_url,
+        promotion_changed_files=changed,
     )
