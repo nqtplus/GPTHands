@@ -263,6 +263,10 @@ class WindowsAppContainerSandbox:
         self._userenv.DeriveAppContainerSidFromAppContainerName.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
         self._userenv.DeleteAppContainerProfile.restype = ctypes.c_long
         self._userenv.DeleteAppContainerProfile.argtypes = [wintypes.LPCWSTR]
+        self._userenv.CreateEnvironmentBlock.restype = wintypes.BOOL
+        self._userenv.CreateEnvironmentBlock.argtypes = [ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.BOOL]
+        self._userenv.DestroyEnvironmentBlock.restype = wintypes.BOOL
+        self._userenv.DestroyEnvironmentBlock.argtypes = [ctypes.c_void_p]
         self._advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
         self._advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
         self._advapi32.FreeSid.restype = ctypes.c_void_p
@@ -272,22 +276,12 @@ class WindowsAppContainerSandbox:
         self._kernel32.InitializeProcThreadAttributeList.restype = wintypes.BOOL
         self._kernel32.InitializeProcThreadAttributeList.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t)]
         self._kernel32.UpdateProcThreadAttribute.restype = wintypes.BOOL
-        self._kernel32.UpdateProcThreadAttribute.argtypes = [
-            ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p,
-            ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p,
-        ]
+        self._kernel32.UpdateProcThreadAttribute.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
         self._kernel32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
         self._kernel32.CreateProcessW.restype = wintypes.BOOL
-        self._kernel32.CreateProcessW.argtypes = [
-            wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p,
-            wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR,
-            ctypes.POINTER(STARTUPINFOW), ctypes.POINTER(PROCESS_INFORMATION),
-        ]
+        self._kernel32.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR, ctypes.POINTER(STARTUPINFOW), ctypes.POINTER(PROCESS_INFORMATION)]
         self._kernelbase.DeriveCapabilitySidsFromName.restype = wintypes.BOOL
-        self._kernelbase.DeriveCapabilitySidsFromName.argtypes = [
-            wintypes.LPCWSTR, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)), ctypes.POINTER(wintypes.DWORD),
-            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)), ctypes.POINTER(wintypes.DWORD),
-        ]
+        self._kernelbase.DeriveCapabilitySidsFromName.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)), ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)), ctypes.POINTER(wintypes.DWORD)]
 
     @staticmethod
     def available() -> bool:
@@ -302,22 +296,16 @@ class WindowsAppContainerSandbox:
         except (OSError, AttributeError):
             return False
 
-    def run(self, *, command: list[str], workspace: Path, cwd: Path, allow_write: bool,
-            allow_network: bool, isolated_home: Path, env: dict[str, str], timeout: int,
-            max_output_bytes: int) -> WindowsSandboxResult:
+    def run(self, *, command: list[str], workspace: Path, cwd: Path, allow_write: bool, allow_network: bool, isolated_home: Path, env: dict[str, str], timeout: int, max_output_bytes: int) -> WindowsSandboxResult:
         if self._modern is not None:
             try:
-                return self._run_modern(command=command, workspace=workspace, cwd=cwd,
-                    allow_write=allow_write, allow_network=allow_network, isolated_home=isolated_home,
-                    env=env, timeout=timeout, max_output_bytes=max_output_bytes)
+                return self._run_modern(command=command, workspace=workspace, cwd=cwd, allow_write=allow_write, allow_network=allow_network, isolated_home=isolated_home, env=env, timeout=timeout, max_output_bytes=max_output_bytes)
             except WindowsSandboxError:
                 if not self._classic_available:
                     raise
         if not self._classic_available:
             raise WindowsSandboxError("classic Windows AppContainer backend is unavailable")
-        return self._run_classic(command=command, workspace=workspace, cwd=cwd,
-            allow_write=allow_write, allow_network=allow_network, isolated_home=isolated_home,
-            env=env, timeout=timeout, max_output_bytes=max_output_bytes)
+        return self._run_classic(command=command, workspace=workspace, cwd=cwd, allow_write=allow_write, allow_network=allow_network, isolated_home=isolated_home, env=env, timeout=timeout, max_output_bytes=max_output_bytes)
 
     def _wait_process(self, info: PROCESS_INFORMATION, timeout: int) -> int:
         wait = self._kernel32.WaitForSingleObject(info.hProcess, max(1, timeout) * 1000)
@@ -332,9 +320,7 @@ class WindowsAppContainerSandbox:
             raise WindowsSandboxError(f"GetExitCodeProcess failed: {ctypes.get_last_error()}")
         return int(exit_code.value)
 
-    def _run_modern(self, *, command: list[str], workspace: Path, cwd: Path, allow_write: bool,
-                    allow_network: bool, isolated_home: Path, env: dict[str, str], timeout: int,
-                    max_output_bytes: int) -> WindowsSandboxResult:
+    def _run_modern(self, *, command: list[str], workspace: Path, cwd: Path, allow_write: bool, allow_network: bool, isolated_home: Path, env: dict[str, str], timeout: int, max_output_bytes: int) -> WindowsSandboxResult:
         import msvcrt
         workspace, cwd, isolated_home = workspace.resolve(strict=True), cwd.resolve(strict=True), isolated_home.resolve(strict=True)
         proc_env = _safe_windows_env(env, isolated_home)
@@ -352,10 +338,7 @@ class WindowsAppContainerSandbox:
             startup.hStdInput = wintypes.HANDLE(msvcrt.get_osfhandle(stdin_handle.fileno()))
             startup.hStdOutput = wintypes.HANDLE(msvcrt.get_osfhandle(output_handle.fileno())); startup.hStdError = startup.hStdOutput
             info = PROCESS_INFORMATION()
-            ok = self._modern(str(executable), command_line, None, None, False,
-                _CREATE_UNICODE_ENVIRONMENT | _CREATE_NO_WINDOW, ctypes.cast(environment, ctypes.c_void_p),
-                str(cwd), ctypes.byref(startup), _identity(workspace), ctypes.cast(spec_buffer, ctypes.c_void_p),
-                len(spec), ctypes.byref(info))
+            ok = self._modern(str(executable), command_line, None, None, False, _CREATE_UNICODE_ENVIRONMENT | _CREATE_NO_WINDOW, ctypes.cast(environment, ctypes.c_void_p), str(cwd), ctypes.byref(startup), _identity(workspace), ctypes.cast(spec_buffer, ctypes.c_void_p), len(spec), ctypes.byref(info))
             if not ok:
                 raise WindowsSandboxError(f"CreateProcessInSandbox failed with Win32 error {ctypes.get_last_error()}")
             try: returncode = self._wait_process(info, timeout)
@@ -382,12 +365,10 @@ class WindowsAppContainerSandbox:
         finally: self._kernel32.LocalFree(ctypes.cast(value, ctypes.c_void_p))
 
     def _grant_staging_access(self, path: Path, sid_text: str) -> None:
-        grant = subprocess.run(["icacls.exe", str(path), "/grant", f"*{sid_text}:(OI)(CI)M", "/T", "/C", "/Q"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=False, check=False)
+        grant = subprocess.run(["icacls.exe", str(path), "/grant", f"*{sid_text}:(OI)(CI)M", "/T", "/C", "/Q"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=False, check=False)
         if grant.returncode != 0:
             raise WindowsSandboxError(f"icacls AppContainer grant failed: {grant.stdout.decode(errors='replace')[:500]}")
-        integrity = subprocess.run(["icacls.exe", str(path), "/setintegritylevel", "(OI)(CI)L", "/T", "/C", "/Q"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=False, check=False)
+        integrity = subprocess.run(["icacls.exe", str(path), "/setintegritylevel", "(OI)(CI)L", "/T", "/C", "/Q"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=False, check=False)
         if integrity.returncode != 0:
             raise WindowsSandboxError(f"icacls low-integrity label failed: {integrity.stdout.decode(errors='replace')[:500]}")
 
@@ -408,9 +389,13 @@ class WindowsAppContainerSandbox:
                 if array[index]: self._kernel32.LocalFree(array[index])
             self._kernel32.LocalFree(ctypes.cast(array, ctypes.c_void_p))
 
-    def _run_classic(self, *, command: list[str], workspace: Path, cwd: Path, allow_write: bool,
-                     allow_network: bool, isolated_home: Path, env: dict[str, str], timeout: int,
-                     max_output_bytes: int) -> WindowsSandboxResult:
+    def _native_system_environment(self) -> ctypes.c_void_p:
+        block = ctypes.c_void_p()
+        if not self._userenv.CreateEnvironmentBlock(ctypes.byref(block), None, False):
+            raise WindowsSandboxError(f"CreateEnvironmentBlock failed: {ctypes.get_last_error()}")
+        return block
+
+    def _run_classic(self, *, command: list[str], workspace: Path, cwd: Path, allow_write: bool, allow_network: bool, isolated_home: Path, env: dict[str, str], timeout: int, max_output_bytes: int) -> WindowsSandboxResult:
         import msvcrt
         workspace, cwd, isolated_home = workspace.resolve(strict=True), cwd.resolve(strict=True), isolated_home.resolve(strict=True)
         staged = isolated_home / "workspace"
@@ -419,38 +404,30 @@ class WindowsAppContainerSandbox:
         mapped = _map_workspace_args(command, workspace, staged)
         proc_env = _safe_windows_env(env, isolated_home)
         executable = _resolve_executable(mapped, proc_env); mapped[0] = str(executable)
-        identity = _identity(workspace); sid = ctypes.c_void_p(); created = False; attribute_list = None; allocations = []
+        identity = _identity(workspace); sid = ctypes.c_void_p(); created = False; attribute_list = None; allocations = []; native_env = None
         try:
             sid, created = self._create_profile(identity)
             self._grant_staging_access(isolated_home, self._sid_string(sid))
             capability_array, allocations = self._capabilities(allow_network)
-            capabilities = SECURITY_CAPABILITIES(sid,
-                ctypes.cast(capability_array, ctypes.POINTER(SID_AND_ATTRIBUTES)) if capability_array is not None else None,
-                1 if capability_array is not None else 0, 0)
+            capabilities = SECURITY_CAPABILITIES(sid, ctypes.cast(capability_array, ctypes.POINTER(SID_AND_ATTRIBUTES)) if capability_array is not None else None, 1 if capability_array is not None else 0, 0)
             output_path = isolated_home / "command-output.bin"
             with open(os.devnull, "rb", buffering=0) as stdin_handle, open(output_path, "w+b", buffering=0) as output_handle:
                 os.set_inheritable(stdin_handle.fileno(), True); os.set_inheritable(output_handle.fileno(), True)
-                handles = (wintypes.HANDLE * 3)(wintypes.HANDLE(msvcrt.get_osfhandle(stdin_handle.fileno())),
-                    wintypes.HANDLE(msvcrt.get_osfhandle(output_handle.fileno())), wintypes.HANDLE(msvcrt.get_osfhandle(output_handle.fileno())))
+                handles = (wintypes.HANDLE * 3)(wintypes.HANDLE(msvcrt.get_osfhandle(stdin_handle.fileno())), wintypes.HANDLE(msvcrt.get_osfhandle(output_handle.fileno())), wintypes.HANDLE(msvcrt.get_osfhandle(output_handle.fileno())))
                 size = ctypes.c_size_t(0); self._kernel32.InitializeProcThreadAttributeList(None, 2, 0, ctypes.byref(size))
                 if not size.value: raise WindowsSandboxError("InitializeProcThreadAttributeList did not return a size")
                 buffer = ctypes.create_string_buffer(size.value); attribute_list = ctypes.cast(buffer, ctypes.c_void_p)
                 if not self._kernel32.InitializeProcThreadAttributeList(attribute_list, 2, 0, ctypes.byref(size)):
                     raise WindowsSandboxError(f"InitializeProcThreadAttributeList failed: {ctypes.get_last_error()}")
-                if not self._kernel32.UpdateProcThreadAttribute(attribute_list, 0, _PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-                    ctypes.byref(capabilities), ctypes.sizeof(capabilities), None, None):
+                if not self._kernel32.UpdateProcThreadAttribute(attribute_list, 0, _PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, ctypes.byref(capabilities), ctypes.sizeof(capabilities), None, None):
                     raise WindowsSandboxError(f"security-capabilities attribute failed: {ctypes.get_last_error()}")
-                if not self._kernel32.UpdateProcThreadAttribute(attribute_list, 0, _PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                    ctypes.cast(handles, ctypes.c_void_p), ctypes.sizeof(handles), None, None):
+                if not self._kernel32.UpdateProcThreadAttribute(attribute_list, 0, _PROC_THREAD_ATTRIBUTE_HANDLE_LIST, ctypes.cast(handles, ctypes.c_void_p), ctypes.sizeof(handles), None, None):
                     raise WindowsSandboxError(f"handle-list attribute failed: {ctypes.get_last_error()}")
                 startup = STARTUPINFOEXW(); startup.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW); startup.StartupInfo.dwFlags = _STARTF_USESTDHANDLES
                 startup.StartupInfo.hStdInput, startup.StartupInfo.hStdOutput, startup.StartupInfo.hStdError = handles[0], handles[1], handles[2]
                 startup.lpAttributeList = attribute_list
-                command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(mapped)); environment = _environment_block(proc_env); info = PROCESS_INFORMATION()
-                ok = self._kernel32.CreateProcessW(str(executable), command_line, None, None, True,
-                    _CREATE_UNICODE_ENVIRONMENT | _CREATE_NO_WINDOW | _EXTENDED_STARTUPINFO_PRESENT,
-                    ctypes.cast(environment, ctypes.c_void_p), str(staged_cwd),
-                    ctypes.cast(ctypes.byref(startup), ctypes.POINTER(STARTUPINFOW)), ctypes.byref(info))
+                command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(mapped)); info = PROCESS_INFORMATION(); native_env = self._native_system_environment()
+                ok = self._kernel32.CreateProcessW(str(executable), command_line, None, None, True, _CREATE_UNICODE_ENVIRONMENT | _CREATE_NO_WINDOW | _EXTENDED_STARTUPINFO_PRESENT, native_env, str(staged_cwd), ctypes.cast(ctypes.byref(startup), ctypes.POINTER(STARTUPINFOW)), ctypes.byref(info))
                 if not ok: raise WindowsSandboxError(f"classic AppContainer CreateProcessW failed: {ctypes.get_last_error()}")
                 try: returncode = self._wait_process(info, timeout)
                 finally:
@@ -459,6 +436,8 @@ class WindowsAppContainerSandbox:
             if allow_write: _sync_stage_back(staged, workspace)
             return WindowsSandboxResult(returncode, output, "windows-appcontainer-classic")
         finally:
+            if native_env:
+                self._userenv.DestroyEnvironmentBlock(native_env)
             if attribute_list is not None:
                 try: self._kernel32.DeleteProcThreadAttributeList(attribute_list)
                 except Exception: pass
