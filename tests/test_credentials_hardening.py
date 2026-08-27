@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import ctypes
+import subprocess
 import unittest
 from unittest import mock
 
 from gpthands import credentials
-from gpthands.credentials import CredentialStore
+from gpthands.credentials import CredentialStore, CredentialStoreError
 
 
 class _FakeSecurity:
@@ -59,6 +60,37 @@ class CredentialHardeningTests(unittest.TestCase):
             CredentialStore, "_mac_api", return_value=(_FakeSecurity(), _FakeCore())
         ):
             self.assertEqual(CredentialStore().backend(), "macos-keychain")
+
+    def test_portable_secret_size_limit_is_fail_closed_before_backend(self) -> None:
+        too_large = "X" * (credentials._MAX_SECRET_BYTES + 1)
+        with mock.patch.object(CredentialStore, "backend") as backend:
+            with self.assertRaises(CredentialStoreError):
+                CredentialStore().set("demo", too_large)
+        backend.assert_not_called()
+
+    def test_secret_service_helper_is_absolute_and_timeout_bounded(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["/usr/bin/secret-tool"],
+            0,
+            stdout="",
+            stderr="",
+        )
+        with mock.patch.object(CredentialStore, "_linux_tool", return_value="/usr/bin/secret-tool"), mock.patch(
+            "gpthands.credentials.subprocess.run", return_value=completed
+        ) as run:
+            CredentialStore._linux_set("demo", "secret")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[0], "/usr/bin/secret-tool")
+        self.assertEqual(run.call_args.kwargs["timeout"], credentials._SECRET_TOOL_TIMEOUT_SECONDS)
+        self.assertFalse(run.call_args.kwargs["shell"])
+
+    def test_secret_service_timeout_becomes_credential_error(self) -> None:
+        with mock.patch.object(CredentialStore, "_linux_tool", return_value="/usr/bin/secret-tool"), mock.patch(
+            "gpthands.credentials.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["/usr/bin/secret-tool"], 10),
+        ):
+            with self.assertRaisesRegex(CredentialStoreError, "timed out"):
+                CredentialStore._linux_get("demo")
 
 
 if __name__ == "__main__":
