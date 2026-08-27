@@ -54,7 +54,7 @@
 - [x] Per-server rate limits and concurrency/queue quotas
 - [x] Version-consistency regression between package metadata and effective server
 
-Windows execution now uses a private staged workspace and a real AppContainer process. CI proves process startup/output capture, workspace read isolation, outside-workspace read denial, RO/RW enforcement, network denial without capability, and sanitized environment behavior. Windows 11 SandboxEngine is preferred when available; classic AppContainer is the native fallback on supported Windows Server/desktop hosts.
+Windows execution uses a private staged workspace and a real AppContainer process. CI proves process startup/output capture, workspace read isolation, outside-workspace read denial, RO/RW enforcement, network denial without capability, and sanitized environment behavior.
 
 ## v0.4 — ChatGPT integration UX ✅
 
@@ -75,12 +75,32 @@ Windows execution now uses a private staged workspace and a real AppContainer pr
 
 See `docs/V04_CHATGPT_INTEGRATION.md` for the integration flow and security model.
 
-## v1.0 — Stable secure local coding bridge
+## v1.0 — Stable secure local coding bridge — RC1 internally verified
 
-- [ ] External security review
-- [ ] Stable MCP compatibility contract
-- [ ] Cross-platform packaged installers
-- [ ] Tagged signed/attested releases
-- [ ] Hardened process-tree/resource controls on every declared platform
-- [ ] Documented secure deployment profiles
-- [ ] Upgrade/rollback strategy for packaged releases
+Current candidate: **`1.0.0rc1`**. Internal implementation and CI gates are complete. Stable `1.0.0` remains blocked on an independent external security review and the final tagged signed/attested release.
+
+- [ ] External security review by an independent reviewer
+- [x] Stable MCP compatibility contract: current `2026-07-28` + legacy `2025-06-18`
+- [x] Cross-platform packaged installer bundles for Linux, macOS and Windows
+- [ ] Tagged signed/attested stable `v1.0.0` release
+- [x] Hardened process-tree/resource controls on every declared platform
+- [x] Documented secure deployment profiles
+- [x] Upgrade/rollback strategy for packaged releases
+- [x] Windows classic AppContainer stable path uses suspended launch + Job Object containment
+- [x] Windows reparse-point/junction escape refusal before execution and before sync-back
+- [x] Real Job Object child inheritance / `KILL_ON_JOB_CLOSE` integration proof
+- [x] Real installer install → upgrade → rollback smoke tests on Ubuntu, macOS and Windows
+- [x] Reproducible RC wheel + deterministic platform bundles + SBOM + SHA256SUMS
+
+### Stable-release gate
+
+`v1.0.0` must not be tagged as stable until all of the following are true:
+
+1. independent security review completed;
+2. critical/high findings fixed or explicitly dispositioned;
+3. full CI matrix green on the reviewed commit;
+4. package version changed from `1.0.0rcN` to `1.0.0`;
+5. release tag matches the package version exactly;
+6. release artifacts, checksums, provenance and SBOM attestations are published from that tag.
+
+See `docs/EXTERNAL_SECURITY_REVIEW.md`, `docs/MCP_COMPATIBILITY.md`, `docs/SECURE_DEPLOYMENT_PROFILES.md`, and `docs/UPGRADE_ROLLBACK.md`.
