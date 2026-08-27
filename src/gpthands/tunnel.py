@@ -84,7 +84,7 @@ def _runtime_env(credential_name: str | None) -> dict[str, str]:
     return env
 
 
-def execute_tunnel_step(argv: list[str], *, credential_name: str | None = None, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+def execute_tunnel_step(argv: list[str], *, credential_name: str | None = None, timeout: int | None = 60) -> subprocess.CompletedProcess[str]:
     if not argv:
         raise TunnelError("empty tunnel command")
     try:
