@@ -118,9 +118,13 @@ class SandboxRunner:
         if plan.backend == "bubblewrap" and completed.returncode != 0:
             diagnostic = completed.stdout.decode("utf-8", errors="replace").strip()
             # Bubblewrap setup failures happen before the target program starts.
-            # Treat them as a failed security boundary rather than as command output.
+            # Treat them as a failed security boundary rather than command output.
             if diagnostic.startswith("bwrap:"):
-                if not allow_network and ("loopback" in diagnostic or "RTM_NEWADDR" in diagnostic):
+                if not allow_network and (
+                    "loopback" in diagnostic
+                    or "RTM_NEWADDR" in diagnostic
+                    or "network namespace" in diagnostic.lower()
+                ):
                     raise SandboxError(
                         "Linux network namespace isolation is unavailable on this host; refusing to run the target process with network denied"
                     )
@@ -145,13 +149,12 @@ class SandboxRunner:
             "--die-with-parent",
             "--new-session",
             "--unshare-all",
-            # UID/GID 0 is only inside the new user namespace and maps to the
-            # invoking host user; it does not grant host root authority.
-            "--uid",
-            "0",
-            "--gid",
-            "0",
         ]
+        # Do not force --uid/--gid remapping. Some hardened/containerized hosts
+        # allow bubblewrap mount namespaces but deny writing uid_map/gid_map.
+        # Bubblewrap's default user mapping preserves the invoking unprivileged
+        # identity and is sufficient for filesystem isolation.
+        #
         # --unshare-all includes a network namespace. Sharing the host network
         # back in is only allowed for explicitly network-authorized actions.
         if allow_network:
@@ -183,6 +186,10 @@ class SandboxRunner:
         lines = [
             "(version 1)",
             "(deny default)",
+            # Apple's system baseline grants the minimum runtime services used
+            # by ordinary command-line processes. We keep our own filesystem
+            # and network grants narrow rather than using broad `allow default`.
+            '(import "system.sb")',
             "(allow process-exec)",
             "(allow process-fork)",
             "(allow process-info* (target same-sandbox))",
@@ -222,4 +229,8 @@ class SandboxRunner:
             lines.append(f"(allow file-write* (subpath {q(workspace)}))")
         if allow_network:
             lines += ["(allow network-outbound)", "(allow network-inbound)"]
+        else:
+            # Defense in depth in case the imported system baseline grants a
+            # narrow networking primitive on a future macOS release.
+            lines.append("(deny network*)")
         return "\n".join(lines)
