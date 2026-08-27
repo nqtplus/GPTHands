@@ -211,6 +211,7 @@ class AuditLogger:
         duplicate = os.dup(self._fd)
         try:
             with os.fdopen(duplicate, "rb", closefd=True) as handle:
+                handle.seek(0)
                 legacy_bytes = handle.read()
         except Exception:
             try:
