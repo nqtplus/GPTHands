@@ -18,8 +18,7 @@ from .diagnostics import diagnostic_json
 from .installer import InstallError, UserInstaller
 from .policy import POLICY_SCHEMA_VERSION, Policy, PolicyError, default_policy_path, migrate_policy_data
 from .risk import RiskLevel
-from .server import serve_stdio
-from .stable_server import V10GPTHandsServer
+from .stable_server import V10GPTHandsServer, serve_stdio_bounded
 from .state import state_root
 from .trust import TrustError, WorkspaceTrustStore
 from .tunnel import TunnelError, build_tunnel_plan, execute_tunnel_step
@@ -82,7 +81,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GPTHands stable secure local MCP bridge")
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
-    serve = sub.add_parser("serve", help="serve MCP over stdio (2026-07-28 + legacy 2025-06-18)")
+    serve = sub.add_parser("serve", help="serve MCP over bounded stdio (2026-07-28 + legacy 2025-06-18)")
     _workspace_arg(serve)
     serve.add_argument("--policy", type=Path)
     serve.add_argument("--audit-log", type=Path, default=default_audit_path())
@@ -303,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
         audit = AuditLogger(args.audit_log, workspace=workspace)
         approvals = ApprovalManager(default_approval_key_path())
         try:
-            return serve_stdio(V10GPTHandsServer(policy, audit, approvals=approvals))
+            return serve_stdio_bounded(V10GPTHandsServer(policy, audit, approvals=approvals))
         finally:
             audit.close()
             approvals.close()
