@@ -13,7 +13,7 @@ authors = [{ name = "GPTHands contributors" }]
 dependencies = []
 
 [project.scripts]
-gpthands = "gpthands.server:main"
+gpthands = "gpthands.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
