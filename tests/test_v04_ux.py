@@ -6,12 +6,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from gpthands.approval import ApprovalManager
+from gpthands.approval import ApprovalError, ApprovalManager
 from gpthands.audit import AuditLogger
-from gpthands.control_ui import create_control_server
+from gpthands.control_ui import ControlUIError, create_control_server
 from gpthands.credentials import CredentialStore, CredentialStoreError
 from gpthands.installer import UserInstaller
+from gpthands.pending_approvals import PendingApprovalStore
 from gpthands.policy import Policy
+from gpthands.risk import RiskLevel
 from gpthands.trust import WorkspaceTrustStore
 from gpthands.tunnel import TunnelError, build_tunnel_plan
 from gpthands.ux_server import V04GPTHandsServer
@@ -64,13 +66,60 @@ class V04UXTests(unittest.TestCase):
             self.assertEqual(server.server_address[0], "127.0.0.1")
             self.assertGreater(server.server_address[1], 0)
             self.assertGreaterEqual(len(server.csrf_token), 32)
-            with self.assertRaises(Exception):
+            with self.assertRaises(ControlUIError):
                 server.switch_workspace(str(other))
             server.trust_store.trust(other, label="other")
             server.switch_workspace(str(other))
             self.assertEqual(server.workspace, other)
         finally:
             server.server_close()
+
+    def test_pending_approval_store_contains_only_minimal_metadata(self) -> None:
+        path = self.state / "pending.json"
+        action_hash = "b" * 64
+        store = PendingApprovalStore(path)
+        try:
+            record = store.add(workspace=self.workspace, risk="EXEC", action_hash=action_hash)
+            self.assertEqual(record["risk"], "EXEC")
+            self.assertEqual(record["action_hash"], action_hash)
+            self.assertNotIn("argv", record)
+            self.assertNotIn("content", record)
+            self.assertNotIn("token", record)
+            rows = store.list_for_workspace(self.workspace)
+            self.assertEqual(len(rows), 1)
+            self.assertTrue(store.remove(workspace=self.workspace, action_hash=action_hash))
+            self.assertEqual(store.list_for_workspace(self.workspace), [])
+        finally:
+            store.close()
+
+    def test_missing_approval_is_queued_before_authoritative_refusal(self) -> None:
+        path = self.state / "pending-server.json"
+        action_hash = "c" * 64
+        audit = AuditLogger(self.state / "audit.jsonl", workspace=self.workspace)
+        approvals = ApprovalManager(self.state / "approval.key")
+        policy = Policy(workspace=self.workspace, policy_path=self.state / "policy.json")
+        server = V04GPTHandsServer(policy, audit, approvals=approvals)
+
+        def factory():
+            return PendingApprovalStore(path)
+
+        try:
+            with mock.patch("gpthands.ux_server.PendingApprovalStore", side_effect=factory), mock.patch(
+                "gpthands.ux_server.notify_approval_required", return_value=True
+            ):
+                with self.assertRaises(ApprovalError):
+                    server._require_approval(None, risk=RiskLevel.EXEC, action_hash=action_hash)
+            store = PendingApprovalStore(path)
+            try:
+                rows = store.list_for_workspace(self.workspace)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["action_hash"], action_hash)
+                self.assertEqual(rows[0]["risk"], "EXEC")
+            finally:
+                store.close()
+        finally:
+            audit.close()
+            approvals.close()
 
     def test_installer_uninstall_restores_preexisting_launcher(self) -> None:
         bin_dir = self.base / "bin"
@@ -87,10 +136,10 @@ class V04UXTests(unittest.TestCase):
         self.assertEqual(original.read_text(encoding="utf-8"), "ORIGINAL")
 
     def test_v04_server_advertises_version(self) -> None:
-        audit = AuditLogger(self.state / "audit.jsonl", workspace=self.workspace)
-        approvals = ApprovalManager(self.state / "approval.key")
+        audit = AuditLogger(self.state / "audit-v04.jsonl", workspace=self.workspace)
+        approvals = ApprovalManager(self.state / "approval-v04.key")
         try:
-            policy = Policy(workspace=self.workspace, policy_path=self.state / "policy.json")
+            policy = Policy(workspace=self.workspace, policy_path=self.state / "policy-v04.json")
             server = V04GPTHandsServer(policy, audit, approvals=approvals)
             response = server.handle({
                 "jsonrpc": "2.0",
