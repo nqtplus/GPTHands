@@ -21,7 +21,11 @@
 ## v0.2 — OS sandbox and approvals ✅
 
 - [x] Linux bubblewrap/namespaces process sandbox
-- [x] macOS conservative `sandbox-exec` profile with fail-closed unsupported-backend behavior
+- [x] Linux fail-closed behavior when unprivileged namespaces are unavailable
+- [x] Real Linux bubblewrap RO/RW mount + network namespace enforcement probe in CI
+- [x] macOS conservative `sandbox-exec` profile with `system.sb` runtime baseline
+- [x] Real macOS read/write sandbox integration tests in CI
+- [x] Fail-closed unsupported-backend behavior
 - [x] Network egress deny-by-default at OS layer
 - [x] Per-action risk levels: READ / WRITE / EXEC / NETWORK / DESTRUCTIVE
 - [x] Human approval token for high-risk operations
@@ -30,7 +34,7 @@
 - [x] Git-specific safe read operations instead of generic shell where possible
 - [x] Safe edit API with preview/diff + base hash + one-time preview id before write
 - [x] Persistent approval replay protection across server restarts
-- [x] Real Linux bubblewrap isolation tests in CI
+- [x] Python 3.11–3.14 security regression matrix
 
 ## v0.3 — Production hardening
 
