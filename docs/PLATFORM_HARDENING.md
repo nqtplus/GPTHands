@@ -1,25 +1,33 @@
 # GPTHands Platform Hardening Strategy
 
-This document defines the next OS-isolation boundary without weakening the current fail-closed model.
+This document defines the OS-isolation boundary and the remaining hardening work without weakening GPTHands' fail-closed model.
 
 ## Security invariant
 
-A platform backend is only considered usable when it can enforce all of the following independently of model intent:
+A platform backend is considered usable for generic process execution only when it can enforce the required boundary independently of model intent:
 
 1. workspace-scoped filesystem visibility;
 2. read-only workspace when no live write lease exists;
-3. no host credential/home-directory visibility by default;
+3. no arbitrary host credential/home-directory inheritance by default;
 4. network deny-by-default;
-5. bounded process lifetime/resources;
+5. bounded process lifetime;
 6. no silent fallback to an unsandboxed process when `require_os_sandbox=true`.
 
-A backend that only limits CPU/memory or only changes process integrity level is **not** sufficient.
+A backend that only limits CPU/memory or only changes process integrity level is not accepted as the primary isolation boundary.
+
+## Linux
+
+The current backend uses bubblewrap with constrained mounts, private HOME/TMP, an RO or RW workspace bind selected from the live write capability, and a separate network namespace when network access is denied.
+
+CI exercises both fail-closed behavior on an unprivileged path and a real privileged bubblewrap isolation probe.
 
 ## macOS
 
-### Current v0.2/v0.3 backend
+### Current compatibility backend
 
-`sandbox-exec`/Seatbelt remains the low-overhead backend where it is present. CI executes real read/write isolation tests on a GitHub macOS runner. The project treats this as a compatibility backend because Apple has deprecated the public `sandbox-exec` interface.
+`sandbox-exec`/Seatbelt remains the low-overhead compatibility backend where it is present. CI executes real read/write isolation tests on a GitHub macOS runner.
+
+Apple has deprecated the public `sandbox-exec` interface, so GPTHands does not treat it as a permanent platform contract.
 
 ### Durable successor
 
@@ -28,7 +36,7 @@ The preferred long-term boundary is a dedicated sandbox helper with a VM/contain
 ```text
 GPTHands MCP process
         |
-        | signed request + explicit workspace grant
+        | explicit workspace grant
         v
 sandbox helper
         |
@@ -40,65 +48,85 @@ sandbox helper
         +--> egress disabled unless lease + approval allow it
 ```
 
-The helper contract must expose capabilities rather than arbitrary host mounts. The host-side GPTHands process remains responsible for policy, leases, approval tokens, audit, and change review.
-
-A native App-Sandbox-entitled helper may be evaluated for low-latency commands, but it is not accepted merely because it has an entitlement; dynamic workspace access, child-process behavior, and network denial must be integration-tested. VM/container isolation is the safer fallback when those guarantees cannot be demonstrated.
+The host-side GPTHands process remains responsible for policy, leases, approvals, audit and change review.
 
 ### Migration rule
 
-The Seatbelt backend stays supported only while its real integration tests pass. If a future macOS image removes or changes it, GPTHands must fail closed until a successor backend passes equivalent tests. There is no `policy-only` automatic downgrade.
+The Seatbelt backend stays supported only while its real integration tests pass. If a future macOS image removes or changes it, GPTHands must fail closed until a successor backend passes equivalent tests. There is no automatic downgrade to policy-only execution.
 
 ## Windows
 
-### Current v0.3 behavior
+### v0.4 implementation
 
-Windows process execution with `require_os_sandbox=true` intentionally fails closed. CI verifies that behavior. Job Objects or low-integrity tokens alone are not accepted as the main boundary because they do not provide sufficient filesystem and network isolation.
-
-### AppContainer staged-workspace design
-
-The target Windows backend is an AppContainer process operating on a **staged workspace**, not directly on the user's real repository:
+Windows generic process execution now uses a **real AppContainer process operating on a private staged workspace**.
 
 ```text
 real repository
      |
-     | policy-filtered copy
+     | private copy
      v
-private staging directory
+per-action staging root
      |
-     | ACL: generated AppContainer SID only
+     | AppContainer SID ACL
+     | workspace = RO or RW
+     | private scratch/TEMP = RW
      v
 AppContainer process
-  - no network capabilities by default
-  - no host home/credential access
-  - Job Object resource limits
+  - no network capability by default
+  - sanitized child environment
+  - explicit inherited-handle allowlist
      |
-     | verified change set
+     | successful RW action only
      v
-GPTHands preview/apply path
+synchronize regular-file changes
      |
      v
 real repository
 ```
 
-Key properties:
+The real repository is not ACL-granted to the AppContainer identity. The classic backend stages the workspace first, maps workspace arguments to the staging tree, grants the generated AppContainer SID only the required staging access, executes there, and synchronizes regular-file changes back only for a write-enabled action.
 
-- never grant AppContainer ACLs to the user's real home or repository tree;
-- create a unique/private staging root per action or lease scope;
-- omit network capabilities unless a NETWORK-classified action has a live lease and required approval;
-- combine AppContainer with a Job Object for timeout/process-tree cleanup/resource limits;
-- copy changes back only through GPTHands path validation and preview/apply controls;
-- reject symlinks/reparse-point escapes during staging and synchronization;
-- delete staging state after use and fail closed if cleanup or ACL setup cannot be verified.
+### Process creation backends
 
-### Acceptance tests required before enabling Windows execution
+GPTHands supports two native AppContainer creation paths:
 
-1. process cannot read a marker file in the user's real home;
-2. process cannot connect to loopback or internet without network capability;
-3. read-only staged workspace rejects writes;
-4. write-enabled staging cannot change files outside staging;
-5. reparse points cannot escape staging;
-6. child processes remain in the Job Object/AppContainer boundary;
-7. timeout terminates the full process tree;
-8. synchronized changes still pass GPTHands secret/path policy.
+1. **Windows SandboxEngine path** — preferred when `Experimental_CreateProcessInSandbox` is available from `processmodel.dll`.
+2. **Classic AppContainer path** — native fallback using `CreateAppContainerProfile` plus `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` and `CreateProcessW`.
 
-Until these tests are implemented and green on Windows CI, Windows remains fail-closed for generic process execution.
+The classic path is required for Windows Server environments where the newer SandboxEngine export is unavailable.
+
+The launcher carries the minimum Windows host environment needed for AppContainer startup, including `LOCALAPPDATA`, while still refusing arbitrary host-environment inheritance. Output/error handles are inherited through an explicit handle allowlist.
+
+### Current enforced properties
+
+The v0.4 Windows CI suite launches real confined processes and verifies:
+
+1. AppContainer process startup and output capture;
+2. a marker inside the workspace is readable;
+3. a sibling marker outside the workspace is not readable;
+4. an RO staged workspace rejects a write;
+5. an RW staged workspace accepts a write and the regular-file result is synchronized back;
+6. outbound access fails when no AppContainer network capability is granted;
+7. an arbitrary host environment sentinel is not inherited by the child;
+8. the SandboxSpec profile omits `internetClient` when network access is denied.
+
+A backend setup failure is treated as an isolation failure, not as permission to execute unsandboxed.
+
+### Important remaining Windows hardening
+
+The v0.4 AppContainer backend closes the previous “no Windows sandbox” gap, but the following are still explicit hardening targets before the stable v1.0 claim:
+
+- dedicated Job Object containment for descendant process-tree cleanup and stronger per-tree CPU/memory limits;
+- adversarial reparse-point/junction escape tests across staging and synchronization;
+- explicit descendant-process inheritance tests proving child processes remain inside the intended AppContainer/process-tree boundary;
+- full-process-tree timeout/kill verification;
+- stricter transactional change synchronization and conflict handling for complex directory mutations;
+- external security review of the Windows ACL/AppContainer boundary.
+
+These items remain roadmap work; they are not silently claimed as completed by the current AppContainer integration tests.
+
+## Cross-platform fail-closed rule
+
+When `require_os_sandbox=true`, failure to construct or launch the declared OS isolation backend must stop the target command. GPTHands must not automatically retry the same target directly on the host.
+
+The platform-specific compatibility mechanisms may evolve, but the security invariant above remains the contract.
