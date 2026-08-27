@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from .risk import RiskLevel, classify_command
+from .risk import RiskLevel, classify_command, command_requires_network
 
 
 class PolicyError(RuntimeError):
@@ -274,12 +274,14 @@ class Policy:
         if not args or not all(isinstance(x, str) and x for x in args):
             raise PolicyError("command must be a non-empty string array")
 
-        program = Path(args[0]).name
-        if program not in self.allowed_commands:
-            raise PolicyError(f"command is not allowlisted: {program}")
+        raw_program = args[0]
+        if Path(raw_program).name != raw_program:
+            raise PolicyError("command executable must be a bare allowlisted name; paths are not allowed")
+        if raw_program not in self.allowed_commands:
+            raise PolicyError(f"command is not allowlisted: {raw_program}")
 
         risk = classify_command(args)
-        if risk == RiskLevel.NETWORK and not self.allow_network_commands:
+        if command_requires_network(args) and not self.allow_network_commands:
             raise PolicyError("network capability is disabled or its lease expired")
         return args, risk
 
