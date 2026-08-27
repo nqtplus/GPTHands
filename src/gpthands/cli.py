@@ -108,11 +108,11 @@ def _build_parser() -> argparse.ArgumentParser:
     _workspace_arg(migrate)
     migrate.add_argument("--policy", type=Path)
 
-    approve = sub.add_parser("approve", help="issue a short-lived one-time human approval token")
+    approve = sub.add_parser("approve", help="issue a short-lived one-time exact-action human approval token")
     _workspace_arg(approve)
     approve.add_argument("--risk", required=True, choices=[r.name for r in RiskLevel])
     approve.add_argument("--seconds", type=int, default=300)
-    approve.add_argument("--action-hash")
+    approve.add_argument("--action-hash", required=True, help="exact pending action SHA-256 shown by GPTHands")
 
     audit = sub.add_parser("audit-verify", help="verify the tamper-evident audit chain")
     audit.add_argument("--audit-log", type=Path, default=default_audit_path())
