@@ -19,11 +19,14 @@ OLD_VERSION = "0.9.999"
 def run(*argv: str, cwd: Path = ROOT) -> str:
     completed = subprocess.run(
         list(argv), cwd=cwd, stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, shell=False, timeout=240, check=False,
     )
     if completed.returncode != 0:
-        raise RuntimeError(f"command failed ({completed.returncode}): {' '.join(argv)}\n{completed.stdout}")
+        raise RuntimeError(
+            f"command failed ({completed.returncode}): {' '.join(argv)}\n"
+            f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}"
+        )
     return completed.stdout
 
 
@@ -48,8 +51,28 @@ def digest(path: Path) -> str:
 
 
 def bootstrap(root: Path, bin_dir: Path, *args: str) -> dict:
-    output = run(sys.executable, str(BOOTSTRAP), "--root", str(root), "--bin-dir", str(bin_dir), *args)
-    return json.loads(output)
+    argv = (sys.executable, str(BOOTSTRAP), "--root", str(root), "--bin-dir", str(bin_dir), *args)
+    completed = subprocess.run(
+        list(argv), cwd=ROOT, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, shell=False, timeout=240, check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"bootstrap failed ({completed.returncode}): {' '.join(argv)}\n"
+            f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}"
+        )
+    if not completed.stdout.strip():
+        raise RuntimeError(
+            f"bootstrap returned success with empty stdout: {' '.join(argv)}\n"
+            f"stderr={completed.stderr!r}"
+        )
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"bootstrap returned non-JSON stdout: {completed.stdout!r}; stderr={completed.stderr!r}"
+        ) from exc
 
 
 def install_args(wheel: Path) -> tuple[str, ...]:
