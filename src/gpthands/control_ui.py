@@ -30,6 +30,14 @@ class _Server(ThreadingHTTPServer):
         self.trust_store = WorkspaceTrustStore()
         self.approvals = ApprovalManager(state_root() / "approval.key")
 
+    def switch_workspace(self, candidate: str) -> None:
+        path = Path(candidate).expanduser().resolve(strict=True)
+        if not path.is_dir():
+            raise ControlUIError("workspace switch target must be a directory")
+        if not self.trust_store.is_trusted(path):
+            raise ControlUIError("workspace switch target is not explicitly trusted")
+        self.workspace = path
+
     def server_close(self) -> None:
         try:
             self.approvals.close()
@@ -77,6 +85,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         if self.path == "/api/status":
             report = diagnostic_report(self.server.workspace)
             report["trusted"] = self.server.trust_store.is_trusted(self.server.workspace)
+            report["trusted_workspaces"] = self.server.trust_store.list()
             self._headers(content_type="application/json; charset=utf-8")
             self.wfile.write(json.dumps(report, ensure_ascii=False).encode("utf-8"))
             return
@@ -84,6 +93,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._html("<h1>Not found</h1>", status=HTTPStatus.NOT_FOUND)
             return
         trusted = self.server.trust_store.is_trusted(self.server.workspace)
+        trusted_rows = self.server.trust_store.list()
         report = diagnostic_report(self.server.workspace)
         rows = "".join(
             f"<tr><td>{html.escape(c['name'])}</td><td>{html.escape(c['status'])}</td><td>{html.escape(c['detail'])}</td></tr>"
@@ -93,6 +103,18 @@ class ControlHandler(BaseHTTPRequestHandler):
         workspace = html.escape(str(self.server.workspace))
         trust_action = "untrust" if trusted else "trust"
         trust_label = "Remove trust" if trusted else "Trust this workspace"
+        switch_options = "".join(
+            f'<option value="{html.escape(str(row.get("path", "")))}"'
+            f'{" selected" if str(row.get("path", "")) == str(self.server.workspace) else ""}>'
+            f'{html.escape(str(row.get("label") or row.get("path") or "workspace"))}</option>'
+            for row in trusted_rows
+            if row.get("path")
+        )
+        switch_form = (
+            f'<form method=post action=/switch><input type=hidden name=csrf value="{token}">'
+            f'<select name=workspace>{switch_options}</select><button>Switch workspace</button></form>'
+            if switch_options else "<p class=muted>No trusted workspace saved yet.</p>"
+        )
         body = f"""
 <style>
 body{{font:14px system-ui;max-width:980px;margin:36px auto;padding:0 18px;color:#1f2328}}h1{{margin-bottom:4px}}.muted{{color:#667085}}.ok{{color:#067647}}.warn{{color:#b54708}}table{{border-collapse:collapse;width:100%;margin:18px 0}}td,th{{border:1px solid #ddd;padding:8px;text-align:left}}fieldset{{margin:18px 0;padding:14px}}input,select,button{{padding:8px;margin:4px}}code{{word-break:break-all}}
@@ -102,6 +124,7 @@ body{{font:14px system-ui;max-width:980px;margin:36px auto;padding:0 18px;color:
 <p><strong>Workspace:</strong> <code>{workspace}</code></p>
 <p><strong>Trust:</strong> {'<span class=ok>trusted</span>' if trusted else '<span class=warn>not trusted</span>'}</p>
 <form method=post action=/{trust_action}><input type=hidden name=csrf value="{token}"><button>{trust_label}</button></form>
+<fieldset><legend>Trusted workspace switcher</legend>{switch_form}</fieldset>
 <h2>Diagnostics</h2><table><tr><th>Check</th><th>Status</th><th>Detail</th></tr>{rows}</table>
 <fieldset><legend>Issue action-bound approval</legend>
 <form method=post action=/approve>
@@ -123,6 +146,9 @@ body{{font:14px system-ui;max-width:980px;margin:36px auto;padding:0 18px;color:
                 return self._redirect()
             if self.path == "/untrust":
                 self.server.trust_store.untrust(self.server.workspace)
+                return self._redirect()
+            if self.path == "/switch":
+                self.server.switch_workspace(form.get("workspace", ""))
                 return self._redirect()
             if self.path == "/approve":
                 risk = RiskLevel.parse(form.get("risk", ""))
