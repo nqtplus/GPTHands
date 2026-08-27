@@ -79,11 +79,12 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
             with open(os.devnull, "rb", buffering=0) as stdin_handle, open(output_path, "w+b", buffering=0) as output_handle:
                 os.set_inheritable(stdin_handle.fileno(), True)
                 os.set_inheritable(output_handle.fileno(), True)
-                handles = (ws.wintypes.HANDLE * 3)(
-                    ws.wintypes.HANDLE(msvcrt.get_osfhandle(stdin_handle.fileno())),
-                    ws.wintypes.HANDLE(msvcrt.get_osfhandle(output_handle.fileno())),
-                    ws.wintypes.HANDLE(msvcrt.get_osfhandle(output_handle.fileno())),
-                )
+                stdin_os = ws.wintypes.HANDLE(msvcrt.get_osfhandle(stdin_handle.fileno()))
+                output_os = ws.wintypes.HANDLE(msvcrt.get_osfhandle(output_handle.fileno()))
+                # PROC_THREAD_ATTRIBUTE_HANDLE_LIST must contain unique handles.
+                # stderr intentionally shares stdout, but the shared OS handle is
+                # listed only once in the inheritance allowlist.
+                handles = (ws.wintypes.HANDLE * 2)(stdin_os, output_os)
 
                 size = ctypes.c_size_t(0)
                 self._kernel32.InitializeProcThreadAttributeList(None, 2, 0, ctypes.byref(size))
@@ -117,9 +118,9 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
                 startup = ws.STARTUPINFOEXW()
                 startup.StartupInfo.cb = ctypes.sizeof(ws.STARTUPINFOEXW)
                 startup.StartupInfo.dwFlags = ws._STARTF_USESTDHANDLES
-                startup.StartupInfo.hStdInput = handles[0]
-                startup.StartupInfo.hStdOutput = handles[1]
-                startup.StartupInfo.hStdError = handles[2]
+                startup.StartupInfo.hStdInput = stdin_os
+                startup.StartupInfo.hStdOutput = output_os
+                startup.StartupInfo.hStdError = output_os
                 startup.lpAttributeList = attribute_list
 
                 command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(mapped))
