@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -107,6 +108,39 @@ class PolicySecurityTests(unittest.TestCase):
             policy.validate_command(["git", "push", "--force"])
 
 
+class AuditSecurityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.external = self.root.parent / f"gpthands-audit-security-{os.getpid()}.jsonl"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+        self.external.unlink(missing_ok=True)
+        (self.external.parent / f"gpthands-audit-link-{os.getpid()}.jsonl").unlink(missing_ok=True)
+
+    def test_audit_log_must_be_outside_workspace(self) -> None:
+        with self.assertRaises(OSError):
+            AuditLogger(self.root / "audit.jsonl", workspace=self.root)
+
+    @unittest.skipIf(os.name == "nt", "symlink behavior varies on Windows")
+    def test_audit_log_must_not_be_symlink(self) -> None:
+        self.external.write_text("", encoding="utf-8")
+        link = self.external.parent / f"gpthands-audit-link-{os.getpid()}.jsonl"
+        link.symlink_to(self.external)
+        with self.assertRaises(OSError):
+            AuditLogger(link, workspace=self.root)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits only")
+    def test_audit_log_is_mode_600(self) -> None:
+        audit = AuditLogger(self.external, workspace=self.root)
+        try:
+            mode = stat.S_IMODE(self.external.stat().st_mode)
+            self.assertEqual(mode, 0o600)
+        finally:
+            audit.close()
+
+
 class ServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -118,7 +152,7 @@ class ServerTests(unittest.TestCase):
         self.audit_path.unlink(missing_ok=True)
 
     def server(self) -> GPTHandsServer:
-        return GPTHandsServer(Policy.load(self.root), AuditLogger(self.audit_path))
+        return GPTHandsServer(Policy.load(self.root), AuditLogger(self.audit_path, workspace=self.root))
 
     def call(self, name: str, arguments: dict | None = None) -> dict:
         response = self.server().handle(
