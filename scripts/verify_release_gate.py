@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -10,7 +12,51 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
-from gpthands.release_gate import ReleaseGateError, verify_release_gate
+from gpthands.release_gate import ReleaseGateError, is_stable_version, verify_release_gate
+
+
+_SHA40 = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        shell=False,
+        check=False,
+        timeout=30,
+    )
+
+
+def _promotion_diff(root: Path, *, version: str, current_commit: str) -> tuple[str, list[str]]:
+    review_path = root / "docs" / "reviews" / f"v{version}.json"
+    try:
+        raw = json.loads(review_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseGateError(f"cannot read stable review metadata before Git verification: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ReleaseGateError("stable review metadata root must be an object")
+    reviewed_commit = raw.get("reviewed_commit")
+    if not isinstance(reviewed_commit, str) or not _SHA40.fullmatch(reviewed_commit):
+        raise ReleaseGateError("reviewed_commit must be a lowercase 40-character Git SHA")
+
+    if reviewed_commit == current_commit:
+        return reviewed_commit, []
+
+    ancestor = _run_git(root, "merge-base", "--is-ancestor", reviewed_commit, current_commit)
+    if ancestor.returncode != 0:
+        raise ReleaseGateError(
+            "reviewed_commit is not an ancestor of the stable release commit; fetch full history and review the correct baseline"
+        )
+
+    diff = _run_git(root, "diff", "--name-only", f"{reviewed_commit}..{current_commit}")
+    if diff.returncode != 0:
+        raise ReleaseGateError(f"cannot inspect stable promotion diff: {diff.stdout.strip()[:500]}")
+    changed = [line.strip() for line in diff.stdout.splitlines() if line.strip()]
+    return reviewed_commit, changed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -22,7 +68,17 @@ def main(argv: list[str] | None = None) -> int:
     root = args.root.resolve(strict=True)
     version = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
     try:
-        result = verify_release_gate(version=version, repository_root=root, current_commit=args.commit)
+        changed_files = None
+        if is_stable_version(version):
+            _reviewed_commit, changed_files = _promotion_diff(
+                root, version=version, current_commit=args.commit
+            )
+        result = verify_release_gate(
+            version=version,
+            repository_root=root,
+            current_commit=args.commit,
+            promotion_changed_files=changed_files,
+        )
     except ReleaseGateError as exc:
         print(f"stable release gate refused: {exc}", file=sys.stderr)
         return 2
@@ -35,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         "reviewed_commit": result.reviewed_commit,
         "reviewer": result.reviewer,
         "report_url": result.report_url,
+        "promotion_changed_files": list(result.promotion_changed_files),
     }, indent=2))
     return 0
 
