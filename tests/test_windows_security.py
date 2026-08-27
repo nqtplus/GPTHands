@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import platform
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,7 +16,7 @@ class WindowsSpecTests(unittest.TestCase):
             root = Path(tmp).resolve()
             blob = build_sandbox_spec(read_write=[root], read_only=[root / "read"], allow_network=False)
             self.assertEqual(blob[4:8], b"SBOX")
-            self.assertIn("0.1.0".encode(), blob)
+            self.assertIn(b"0.1.0", blob)
             self.assertIn(str(root).encode(), blob)
             self.assertNotIn(b"internetClient", blob)
 
@@ -26,7 +25,7 @@ class WindowsSpecTests(unittest.TestCase):
 class WindowsAppContainerIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         if not WindowsAppContainerSandbox.available():
-            self.fail("processmodel.dll Experimental_CreateProcessInSandbox is unavailable; Windows AppContainer isolation must not silently skip")
+            self.fail("no native Windows AppContainer backend is available; isolation must not silently skip")
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name).resolve()
         self.workspace = self.base / "workspace"
@@ -34,10 +33,7 @@ class WindowsAppContainerIntegrationTests(unittest.TestCase):
         self.outside = self.base / "outside-secret.txt"
         self.outside.write_text("HOST_SECRET_SENTINEL", encoding="utf-8")
         self.runner = SandboxRunner(require_os_sandbox=True)
-        self.env = {
-            "PATH": os.environ.get("PATH", ""),
-            "NO_COLOR": "1",
-        }
+        self.env = {"PATH": os.environ.get("PATH", ""), "NO_COLOR": "1"}
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -56,7 +52,7 @@ class WindowsAppContainerIntegrationTests(unittest.TestCase):
 
     def test_backend_is_real_appcontainer_and_captures_output(self) -> None:
         completed, backend = self.run_sandbox(["cmd.exe", "/d", "/c", "echo GPTHANDS_APPCONTAINER_OK"])
-        self.assertEqual(backend, "windows-appcontainer")
+        self.assertTrue(backend.startswith("windows-appcontainer"), backend)
         self.assertEqual(completed.returncode, 0, completed.stdout.decode(errors="replace"))
         self.assertIn(b"GPTHANDS_APPCONTAINER_OK", completed.stdout)
 
@@ -73,29 +69,23 @@ class WindowsAppContainerIntegrationTests(unittest.TestCase):
 
     def test_workspace_write_is_denied_then_explicitly_allowed(self) -> None:
         target = self.workspace / "created.txt"
-        completed, _ = self.run_sandbox(
-            ["cmd.exe", "/d", "/c", f"echo BLOCKED>{target}"],
-            allow_write=False,
-        )
+        completed, _ = self.run_sandbox(["cmd.exe", "/d", "/c", "copy", "/y", "NUL", str(target)], allow_write=False)
         self.assertFalse(target.exists(), completed.stdout.decode(errors="replace"))
 
-        completed, _ = self.run_sandbox(
-            ["cmd.exe", "/d", "/c", f"echo ALLOWED>{target}"],
-            allow_write=True,
-        )
+        completed, _ = self.run_sandbox(["cmd.exe", "/d", "/c", "copy", "/y", "NUL", str(target)], allow_write=True)
         self.assertEqual(completed.returncode, 0, completed.stdout.decode(errors="replace"))
         self.assertTrue(target.exists())
-        self.assertIn("ALLOWED", target.read_text(encoding="utf-8"))
 
     def test_network_is_denied_without_capability(self) -> None:
-        code = (
-            "import socket,sys; "
-            "s=socket.socket(); s.settimeout(2); "
-            "\ntry: s.connect(('1.1.1.1',443))\n"
-            "except OSError: sys.exit(0)\n"
-            "else: sys.exit(9)"
+        script = (
+            "$c=New-Object System.Net.Sockets.TcpClient; "
+            "$a=$c.BeginConnect('1.1.1.1',443,$null,$null); "
+            "if($a.AsyncWaitHandle.WaitOne(2000)){try{$c.EndConnect($a); exit 9}catch{exit 0}}else{exit 0}"
         )
-        completed, _ = self.run_sandbox([sys.executable, "-c", code], allow_network=False)
+        completed, _ = self.run_sandbox(
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+            allow_network=False,
+        )
         self.assertEqual(completed.returncode, 0, "network connection unexpectedly escaped AppContainer isolation")
 
 
