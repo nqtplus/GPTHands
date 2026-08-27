@@ -14,14 +14,14 @@ JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 
 
 class V10GPTHandsServer(V04GPTHandsServer):
-    """Stable dual-era server.
+    """Stable-contract dual-era server used by the v1 release candidate.
 
     Modern 2026-07-28 requests are stateless and need no initialize handshake.
     Legacy 2025-06-18 initialize remains accepted as a compatibility contract.
     Security authority is never derived from client metadata in either era.
     """
 
-    VERSION = "1.0.0"
+    VERSION = "1.0.0rc1"
 
     @staticmethod
     def _server_info_meta() -> dict[str, Any]:
@@ -75,12 +75,10 @@ class V10GPTHandsServer(V04GPTHandsServer):
             params = message.get("params")
             if isinstance(params, dict) and isinstance(params.get("protocolVersion"), str):
                 requested = params["protocolVersion"]
-            # initialize is a legacy-era contract. Never claim the handshake-free
-            # 2026 revision through the legacy negotiation path.
             result["protocolVersion"] = requested if requested == MCP_LEGACY else MCP_LEGACY
             result["serverInfo"] = {"name": "GPTHands", "version": self.VERSION}
             result["instructions"] = (
-                "GPTHands v1.0 legacy MCP compatibility mode. Upgrade clients to 2026-07-28 server/discover "
+                "GPTHands v1 legacy MCP compatibility mode. Upgrade clients to 2026-07-28 server/discover "
                 "for the stateless protocol; security behavior is identical in both eras."
             )
             return response
@@ -88,9 +86,6 @@ class V10GPTHandsServer(V04GPTHandsServer):
         if method == "tools/list" and isinstance(response.get("result"), dict):
             response["result"]["tools"] = self._modern_tools()
 
-        # A request carrying the modern protocol envelope is answered with the
-        # required server identity stamp. We intentionally do not trust client
-        # identity/capabilities for authorization decisions.
         params = message.get("params")
         meta = params.get("_meta") if isinstance(params, dict) else None
         modern = isinstance(meta, dict) and meta.get("io.modelcontextprotocol/protocolVersion") == MCP_CURRENT
