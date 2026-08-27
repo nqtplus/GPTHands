@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import sys
 import tempfile
@@ -19,6 +18,8 @@ from gpthands.stable_server import (
     SERVER_INFO_META_KEY,
     V10GPTHandsServer,
 )
+
+EXPECTED_VERSION = "1.0.0rc1"
 
 
 class V10StableTests(unittest.TestCase):
@@ -46,7 +47,7 @@ class V10StableTests(unittest.TestCase):
             assert response is not None
             result = response["result"]
             self.assertEqual(result["supportedVersions"], [MCP_CURRENT])
-            self.assertEqual(result["_meta"][SERVER_INFO_META_KEY]["version"], "1.0.0")
+            self.assertEqual(result["_meta"][SERVER_INFO_META_KEY]["version"], EXPECTED_VERSION)
             self.assertGreater(result["ttlMs"], 0)
             self.assertEqual(result["cacheScope"], "private")
         finally:
@@ -58,7 +59,7 @@ class V10StableTests(unittest.TestCase):
             response = server.handle({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {"protocolVersion": MCP_LEGACY}})
             assert response is not None
             self.assertEqual(response["result"]["protocolVersion"], MCP_LEGACY)
-            self.assertEqual(response["result"]["serverInfo"]["version"], "1.0.0")
+            self.assertEqual(response["result"]["serverInfo"]["version"], EXPECTED_VERSION)
         finally:
             audit.close(); approvals.close()
 
