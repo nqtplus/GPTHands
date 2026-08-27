@@ -10,10 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .approval import ApprovalError, ApprovalManager
-from .audit import AuditLogger
-from .policy import Policy, PolicyError, default_policy_path
+from .audit import AuditLogger, verify_audit_file
+from .limits import V03GPTHandsServer
+from .policy import POLICY_SCHEMA_VERSION, Policy, PolicyError, default_policy_path, migrate_policy_data
 from .risk import RiskLevel
-from .server import GPTHandsServer, serve_stdio
+from .server import serve_stdio
 
 
 def state_root() -> Path:
@@ -90,18 +91,28 @@ def _build_parser() -> argparse.ArgumentParser:
     init.add_argument("--command", dest="allowed_commands", action="append", default=[])
     init.add_argument("--approval-from", choices=[r.name for r in RiskLevel], default="EXEC")
     init.add_argument("--no-require-os-sandbox", action="store_true")
+    init.add_argument("--max-requests-per-minute", type=int, default=120)
+    init.add_argument("--max-concurrent-actions", type=int, default=4)
+    init.add_argument("--max-queue-seconds", type=int, default=2)
+
+    migrate = sub.add_parser("migrate-policy", help="rewrite a supported historical policy to the current schema")
+    migrate.add_argument("--workspace", type=Path, default=Path.cwd())
+    migrate.add_argument("--policy", type=Path)
 
     approve = sub.add_parser("approve", help="issue a short-lived one-time human approval token")
     approve.add_argument("--workspace", type=Path, default=Path.cwd())
     approve.add_argument("--risk", required=True, choices=[r.name for r in RiskLevel])
     approve.add_argument("--seconds", type=int, default=300)
     approve.add_argument("--action-hash")
+
+    audit = sub.add_parser("audit-verify", help="verify the tamper-evident audit chain")
+    audit.add_argument("--audit-log", type=Path, default=default_audit_path())
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args_in = list(sys.argv[1:] if argv is None else argv)
-    known = {"serve", "policy-path", "init-policy", "approve"}
+    known = {"serve", "policy-path", "init-policy", "migrate-policy", "approve", "audit-verify"}
     if not args_in or args_in[0] not in known:
         args_in.insert(0, "serve")
     args = _build_parser().parse_args(args_in)
@@ -114,6 +125,18 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         return 0
 
+    if args.subcommand == "audit-verify":
+        result = verify_audit_file(args.audit_log)
+        print(json.dumps({
+            "valid": result.valid,
+            "anchored": result.anchored,
+            "chained_records": result.chained_records,
+            "legacy_records": result.legacy_records,
+            "last_hash": result.last_hash,
+            "error": result.error,
+        }, indent=2))
+        return 0 if result.valid else 2
+
     if args.subcommand == "init-policy":
         if not 1 <= args.lease_seconds <= 86_400:
             print("lease-seconds must be between 1 and 86400", file=sys.stderr)
@@ -121,10 +144,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.allow_network and not args.allow_process:
             print("--allow-network requires --allow-process", file=sys.stderr)
             return 2
+        if not 1 <= args.max_requests_per_minute <= 6000:
+            print("max-requests-per-minute must be between 1 and 6000", file=sys.stderr)
+            return 2
+        if not 1 <= args.max_concurrent_actions <= 64:
+            print("max-concurrent-actions must be between 1 and 64", file=sys.stderr)
+            return 2
+        if not 0 <= args.max_queue_seconds <= 30:
+            print("max-queue-seconds must be between 0 and 30", file=sys.stderr)
+            return 2
         try:
             workspace = args.workspace.resolve(strict=True)
             expiry = _lease_iso(args.lease_seconds)
             data = {
+                "schema_version": POLICY_SCHEMA_VERSION,
                 "allow_write": bool(args.allow_write),
                 "allow_process": bool(args.allow_process),
                 "allow_network_commands": bool(args.allow_network),
@@ -134,6 +167,9 @@ def main(argv: list[str] | None = None) -> int:
                 "allowed_commands": args.allowed_commands,
                 "approval_required_from": args.approval_from,
                 "require_os_sandbox": not args.no_require_os_sandbox,
+                "max_requests_per_minute": args.max_requests_per_minute,
+                "max_concurrent_actions": args.max_concurrent_actions,
+                "max_queue_seconds": args.max_queue_seconds,
             }
             target = default_policy_path(workspace)
             _secure_write_policy(target, data, workspace)
@@ -143,34 +179,64 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         return 0
 
+    if args.subcommand == "migrate-policy":
+        try:
+            workspace = args.workspace.resolve(strict=True)
+            target = args.policy or default_policy_path(workspace)
+            if not target.exists():
+                raise PolicyError(f"policy does not exist: {target}")
+            if target.is_symlink():
+                raise PolicyError("policy file must not be a symlink")
+            raw = json.loads(target.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise PolicyError("policy root must be an object")
+            migrated = migrate_policy_data(raw)
+            _secure_write_policy(target, migrated, workspace)
+            Policy.load(workspace, target)
+            print(target)
+        except (PolicyError, OSError, json.JSONDecodeError) as exc:
+            print(f"migrate-policy refused: {exc}", file=sys.stderr)
+            return 2
+        return 0
+
     if args.subcommand == "approve":
         try:
             workspace = args.workspace.resolve(strict=True)
             manager = ApprovalManager(default_approval_key_path())
-            token = manager.issue(
-                workspace=workspace,
-                risk=RiskLevel.parse(args.risk),
-                ttl_seconds=args.seconds,
-                action_hash=args.action_hash,
-            )
+            try:
+                token = manager.issue(
+                    workspace=workspace,
+                    risk=RiskLevel.parse(args.risk),
+                    ttl_seconds=args.seconds,
+                    action_hash=args.action_hash,
+                )
+            finally:
+                manager.close()
             print(token)
         except (ApprovalError, ValueError, OSError) as exc:
             print(f"approval refused: {exc}", file=sys.stderr)
             return 2
         return 0
 
+    approvals: ApprovalManager | None = None
+    audit: AuditLogger | None = None
     try:
         workspace = args.workspace.resolve(strict=True)
         policy = Policy.load(workspace, args.policy)
         audit = AuditLogger(args.audit_log, workspace=workspace)
         approvals = ApprovalManager(default_approval_key_path())
     except (PolicyError, ApprovalError, OSError) as exc:
+        if audit is not None:
+            audit.close()
+        if approvals is not None:
+            approvals.close()
         print(f"GPTHands startup refused: {exc}", file=sys.stderr)
         return 2
     try:
-        return serve_stdio(GPTHandsServer(policy, audit, approvals=approvals))
+        return serve_stdio(V03GPTHandsServer(policy, audit, approvals=approvals))
     finally:
         audit.close()
+        approvals.close()
 
 
 if __name__ == "__main__":
