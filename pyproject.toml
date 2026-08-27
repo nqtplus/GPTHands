@@ -1,16 +1,23 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==84.0.0", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "gpthands"
-version = "0.2.0"
+version = "0.3.0"
 description = "Secure-by-default local MCP coding tools for ChatGPT and MCP clients"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{ name = "GPTHands contributors" }]
 dependencies = []
+
+[project.optional-dependencies]
+test = ["hypothesis==6.165.10"]
+
+[project.urls]
+Repository = "https://github.com/nqtplus/GPTHands"
+Security = "https://github.com/nqtplus/GPTHands/security"
 
 [project.scripts]
 gpthands = "gpthands.cli:main"
