@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -20,6 +21,7 @@ _SECRET_NAME_PATTERNS = (
 )
 
 _SECRET_DIR_NAMES = {".ssh", ".aws", ".gnupg"}
+_PROTECTED_NAMES = {".gpthands.json"}
 
 _DANGEROUS_ARG_PATTERNS = (
     re.compile(r"(^|\s)--privileged($|\s)"),
@@ -39,6 +41,17 @@ _NETWORK_PROGRAMS = {
     "sftp",
     "ftp",
     "telnet",
+}
+
+_NETWORK_SUBCOMMANDS = {
+    "git": {"clone", "fetch", "pull", "push", "ls-remote"},
+    "npm": {"install", "i", "update", "audit", "publish", "login", "whoami"},
+    "pnpm": {"install", "add", "update", "publish", "audit"},
+    "yarn": {"install", "add", "upgrade", "publish", "npm"},
+    "pip": {"install", "download", "index"},
+    "pip3": {"install", "download", "index"},
+    "cargo": {"fetch", "install", "publish", "search", "login"},
+    "go": {"get", "install"},
 }
 
 
@@ -65,6 +78,11 @@ class Policy:
         if config_path.exists():
             if config_path.is_symlink():
                 raise PolicyError(".gpthands.json must not be a symlink")
+            config_stat = config_path.stat()
+            if os.name != "nt" and config_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise PolicyError(".gpthands.json must not be group/world writable")
+            if hasattr(os, "geteuid") and config_stat.st_uid != os.geteuid():
+                raise PolicyError(".gpthands.json must be owned by the current user")
             try:
                 raw = json.loads(config_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
@@ -115,6 +133,7 @@ class Policy:
         if common != self.workspace:
             raise PolicyError("path escapes workspace")
 
+        self._check_protected_path(candidate)
         self._check_secret_path(candidate)
         return candidate
 
@@ -134,8 +153,11 @@ class Policy:
         if program not in self.allowed_commands:
             raise PolicyError(f"command is not allowlisted: {program}")
 
-        if program in _NETWORK_PROGRAMS and not self.allow_network_commands:
-            raise PolicyError(f"network-capable command is disabled: {program}")
+        if not self.allow_network_commands:
+            if program in _NETWORK_PROGRAMS:
+                raise PolicyError(f"network-capable command is disabled: {program}")
+            if len(args) > 1 and args[1].lower() in _NETWORK_SUBCOMMANDS.get(program, set()):
+                raise PolicyError(f"network-capable subcommand is disabled: {program} {args[1]}")
 
         joined = " ".join(args).lower()
         for pattern in _DANGEROUS_ARG_PATTERNS:
@@ -143,6 +165,11 @@ class Policy:
                 raise PolicyError("dangerous command arguments require a future approval flow")
 
         return args
+
+    @staticmethod
+    def _check_protected_path(path: Path) -> None:
+        if path.name.lower() in _PROTECTED_NAMES:
+            raise PolicyError("policy authority file is protected from MCP tools")
 
     @staticmethod
     def _check_secret_path(path: Path) -> None:
