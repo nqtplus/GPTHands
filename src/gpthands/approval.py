@@ -225,8 +225,8 @@ class ApprovalManager:
             raise ApprovalError("approval token risk is invalid") from exc
         if token_risk < minimum_risk:
             raise ApprovalError("approval token does not cover this risk level")
-        if action_hash is not None and payload.get("action") not in (None, action_hash):
-            raise ApprovalError("approval token is bound to another action")
+        if action_hash is not None and payload.get("action") != action_hash:
+            raise ApprovalError("approval token is not bound to this exact action")
 
         nonce = str(payload.get("nonce", ""))
         if not nonce:
