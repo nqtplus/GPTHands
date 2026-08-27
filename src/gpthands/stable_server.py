@@ -11,6 +11,7 @@ from typing import Any, BinaryIO, TextIO
 from .audit import redact_text
 from .policy import PolicyError
 from .risk import RiskLevel
+from .safe_write import stable_atomic_write
 from .server import TOOLS, _action_hash, _relative, _require_str, _rpc_error
 from .ux_server import V04GPTHandsServer
 
@@ -82,6 +83,9 @@ class V10GPTHandsServer(V04GPTHandsServer):
         if args.get("regex", False) is True:
             raise PolicyError("regex grep is disabled in stable v1; use literal search")
         return super()._grep(args)
+
+    def _atomic_write(self, path: Path, content: str, *, overwrite: bool) -> None:
+        stable_atomic_write(self.policy, path, content, overwrite=overwrite)
 
     def _preview_edit(self, args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         target = _require_str(args, "target")
