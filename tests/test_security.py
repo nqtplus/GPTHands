@@ -12,11 +12,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gpthands.approval import ApprovalError, ApprovalManager
-from gpthands.audit import AuditLogger, redact_text
+from gpthands.audit import AuditLogger, content_fingerprint, redact_text
 from gpthands.policy import Policy, PolicyError, default_policy_path
 from gpthands.risk import RiskLevel, classify_command
 from gpthands.sandbox import SandboxError, SandboxRunner
-from gpthands.server import GPTHandsServer
+from gpthands.server import GPTHandsServer, _action_hash
 
 
 class WorkspaceCase(unittest.TestCase):
@@ -208,6 +208,18 @@ class ApprovalTests(WorkspaceCase):
         with self.assertRaises(ApprovalError):
             manager.validate(token, workspace=self.root, minimum_risk=RiskLevel.WRITE, action_hash="different", consume=False)
 
+    def test_unbound_token_cannot_authorize_an_exact_action(self) -> None:
+        manager = ApprovalManager(self.key_path)
+        token = manager.issue(workspace=self.root, risk=RiskLevel.DESTRUCTIVE, ttl_seconds=60)
+        with self.assertRaisesRegex(ApprovalError, "exact action"):
+            manager.validate(
+                token,
+                workspace=self.root,
+                minimum_risk=RiskLevel.WRITE,
+                action_hash="abc",
+                consume=False,
+            )
+
     def test_key_permissions_are_600(self) -> None:
         ApprovalManager(self.key_path)
         if os.name != "nt":
@@ -339,7 +351,16 @@ class ServerV02Tests(WorkspaceCase):
         server = self.server(sandbox=FakeSandbox())
         denied = self.rpc(server, "write_file", {"target": "x.txt", "content": "new", "overwrite": True})
         self.assertTrue(denied["isError"])
-        token = server.approvals.issue(workspace=self.root, risk=RiskLevel.DESTRUCTIVE, ttl_seconds=60)
+        action_hash = _action_hash(
+            "write_file",
+            {"target": "x.txt", "overwrite": True, "content": content_fingerprint("new")},
+        )
+        token = server.approvals.issue(
+            workspace=self.root,
+            risk=RiskLevel.DESTRUCTIVE,
+            ttl_seconds=60,
+            action_hash=action_hash,
+        )
         allowed = self.rpc(server, "write_file", {"target": "x.txt", "content": "new", "overwrite": True, "approval_token": token})
         self.assertFalse(allowed["isError"])
         self.assertEqual((self.root / "x.txt").read_text(encoding="utf-8"), "new")
@@ -373,7 +394,13 @@ class ServerV02Tests(WorkspaceCase):
         server = self.server(sandbox=fake)
         denied = self.rpc(server, "run_command", {"argv": ["git", "fetch"]})
         self.assertTrue(denied["isError"])
-        token = server.approvals.issue(workspace=self.root, risk=RiskLevel.NETWORK, ttl_seconds=60)
+        action_hash = _action_hash("run_command", {"argv": ["git", "fetch"], "cwd": "."})
+        token = server.approvals.issue(
+            workspace=self.root,
+            risk=RiskLevel.NETWORK,
+            ttl_seconds=60,
+            action_hash=action_hash,
+        )
         allowed = self.rpc(server, "run_command", {"argv": ["git", "fetch"], "approval_token": token})
         self.assertFalse(allowed["isError"])
         self.assertTrue(fake.calls[-1]["allow_network"])
