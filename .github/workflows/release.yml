@@ -20,7 +20,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 1
+          # Stable promotion verification needs the externally reviewed baseline
+          # so the workflow can prove no unauthorized files changed afterwards.
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -48,6 +50,11 @@ jobs:
               raise SystemExit(f'tag/version mismatch: expected {expected}, got {actual}')
           print(f'verified release tag {actual}')
           PY
+
+      - name: Enforce external security-review gate for stable releases
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: python scripts/verify_release_gate.py --commit "$RELEASE_COMMIT"
 
       - name: Reproducible release build and packaged installers
         run: |
