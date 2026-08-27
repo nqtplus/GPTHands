@@ -4,12 +4,14 @@ import copy
 import difflib
 import hashlib
 import json
+import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, TextIO
 
+from .audit import redact_text
 from .policy import PolicyError
 from .risk import RiskLevel
-from .server import TOOLS, _action_hash, _relative, _require_str
+from .server import TOOLS, _action_hash, _relative, _require_str, _rpc_error
 from .ux_server import V04GPTHandsServer
 
 MCP_CURRENT = "2026-07-28"
@@ -17,6 +19,7 @@ MCP_LEGACY = "2025-06-18"
 SUPPORTED_PROTOCOL_VERSIONS = (MCP_CURRENT, MCP_LEGACY)
 SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo"
 JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema"
+MAX_MCP_REQUEST_BYTES = 2_000_000
 
 
 class V10GPTHandsServer(V04GPTHandsServer):
@@ -200,3 +203,44 @@ class V10GPTHandsServer(V04GPTHandsServer):
         if modern:
             self._stamp_modern(response)
         return response
+
+
+def serve_stdio_bounded(
+    server: V10GPTHandsServer,
+    *,
+    max_request_bytes: int = MAX_MCP_REQUEST_BYTES,
+    input_buffer: BinaryIO | None = None,
+    output: TextIO | None = None,
+) -> int:
+    """Serve line-delimited MCP JSON without accepting an unbounded input line."""
+    if max_request_bytes < 1024:
+        raise ValueError("max_request_bytes is too small")
+    source = input_buffer or sys.stdin.buffer
+    sink = output or sys.stdout
+
+    while True:
+        raw = source.readline(max_request_bytes + 1)
+        if not raw:
+            break
+        if len(raw) > max_request_bytes:
+            if not raw.endswith(b"\n"):
+                while True:
+                    tail = source.readline(max_request_bytes + 1)
+                    if not tail or tail.endswith(b"\n"):
+                        break
+            response = _rpc_error(None, -32700, "MCP request exceeds stable input byte limit")
+        else:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                message = json.loads(raw.decode("utf-8"))
+                if not isinstance(message, dict):
+                    raise ValueError("JSON-RPC message must be an object")
+                response = server.handle(message)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                response = _rpc_error(None, -32700, redact_text(str(exc)))
+        if response is not None:
+            sink.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
+            sink.flush()
+    return 0
