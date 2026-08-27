@@ -16,6 +16,11 @@ from gpthands.release_gate import ReleaseGateError, is_stable_version, verify_re
 
 
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
+_VERSION_FILES = (
+    "pyproject.toml",
+    "src/gpthands/__init__.py",
+    "src/gpthands/stable_server.py",
+)
 
 
 def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -29,6 +34,61 @@ def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         check=False,
         timeout=30,
     )
+
+
+def _git_show(root: Path, commit: str, path: str) -> str:
+    completed = _run_git(root, "show", f"{commit}:{path}")
+    if completed.returncode != 0:
+        raise ReleaseGateError(
+            f"cannot read reviewed baseline file {path!r}: {completed.stdout.strip()[:500]}"
+        )
+    return completed.stdout
+
+
+def _validate_version_only_promotion(
+    root: Path,
+    *,
+    reviewed_commit: str,
+    stable_version: str,
+    changed_files: list[str],
+) -> None:
+    """Reject executable/package changes disguised as a stable version bump."""
+
+    baseline_pyproject = _git_show(root, reviewed_commit, "pyproject.toml")
+    try:
+        reviewed_version = tomllib.loads(baseline_pyproject)["project"]["version"]
+    except (tomllib.TOMLDecodeError, KeyError, TypeError) as exc:
+        raise ReleaseGateError("cannot determine reviewed baseline package version") from exc
+    if not isinstance(reviewed_version, str):
+        raise ReleaseGateError("reviewed baseline package version must be a string")
+    prerelease_pattern = re.compile(re.escape(stable_version) + r"(?:a|b|rc)\d+")
+    if not prerelease_pattern.fullmatch(reviewed_version):
+        raise ReleaseGateError(
+            f"reviewed baseline version {reviewed_version!r} is not a direct prerelease of stable {stable_version!r}"
+        )
+
+    changed = set(changed_files)
+    missing = set(_VERSION_FILES) - changed
+    if missing:
+        raise ReleaseGateError(
+            "stable promotion must update all synchronized version files: " + ", ".join(sorted(missing))
+        )
+
+    for path in _VERSION_FILES:
+        baseline = _git_show(root, reviewed_commit, path)
+        expected = baseline.replace(reviewed_version, stable_version)
+        if expected == baseline:
+            raise ReleaseGateError(
+                f"reviewed baseline file {path!r} does not contain version {reviewed_version!r}; cannot prove version-only promotion"
+            )
+        try:
+            current = (root / path).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ReleaseGateError(f"cannot read stable promotion file {path!r}: {exc}") from exc
+        if current != expected:
+            raise ReleaseGateError(
+                f"stable promotion file {path!r} contains changes beyond exact {reviewed_version!r} -> {stable_version!r} substitution"
+            )
 
 
 def _promotion_diff(root: Path, *, version: str, current_commit: str) -> tuple[str, list[str]]:
@@ -56,6 +116,12 @@ def _promotion_diff(root: Path, *, version: str, current_commit: str) -> tuple[s
     if diff.returncode != 0:
         raise ReleaseGateError(f"cannot inspect stable promotion diff: {diff.stdout.strip()[:500]}")
     changed = [line.strip() for line in diff.stdout.splitlines() if line.strip()]
+    _validate_version_only_promotion(
+        root,
+        reviewed_commit=reviewed_commit,
+        stable_version=version,
+        changed_files=changed,
+    )
     return reviewed_commit, changed
 
 
