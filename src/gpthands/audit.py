@@ -5,9 +5,12 @@ import json
 import os
 import re
 import stat
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
+
+from .locking import FileLock, LockError
 
 
 _SECRET_VALUE_PATTERNS = (
@@ -16,6 +19,8 @@ _SECRET_VALUE_PATTERNS = (
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
 )
+_AUDIT_CHAIN_VERSION = 1
+_GENESIS_HASH = "0" * 64
 
 
 def redact_text(value: str) -> str:
@@ -33,8 +38,95 @@ def content_fingerprint(value: str) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class AuditVerification:
+    valid: bool
+    chained_records: int
+    legacy_records: int
+    anchored: bool
+    last_hash: str | None = None
+    error: str | None = None
+
+
+def _canonical_event(event: dict[str, Any]) -> bytes:
+    clone = json.loads(json.dumps(event, ensure_ascii=False))
+    audit = clone.get("audit")
+    if isinstance(audit, dict):
+        audit.pop("hash", None)
+    return json.dumps(clone, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _event_hash(event: dict[str, Any], prev_hash: str) -> str:
+    payload = prev_hash.encode("ascii") + b"\n" + _canonical_event(event)
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _verify_stream(handle: BinaryIO) -> AuditVerification:
+    handle.seek(0)
+    previous = _GENESIS_HASH
+    expected_seq = 1
+    chained = 0
+    legacy = 0
+    legacy_hasher = hashlib.sha256()
+    chain_started = False
+
+    for raw_line in handle:
+        if not raw_line.strip():
+            continue
+        try:
+            event = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return AuditVerification(False, chained, legacy, chain_started, previous if chained else None, f"invalid JSONL: {exc}")
+
+        audit = event.get("audit") if isinstance(event, dict) else None
+        if not isinstance(audit, dict) or audit.get("v") != _AUDIT_CHAIN_VERSION:
+            if chain_started:
+                return AuditVerification(False, chained, legacy, True, previous, "legacy/unversioned record appears after hash chain started")
+            legacy += 1
+            legacy_hasher.update(raw_line)
+            continue
+
+        if not chain_started:
+            chain_started = True
+            previous = legacy_hasher.hexdigest() if legacy else _GENESIS_HASH
+
+        try:
+            seq = int(audit.get("seq"))
+            prev_hash = str(audit.get("prev_hash"))
+            supplied = str(audit.get("hash"))
+        except (TypeError, ValueError):
+            return AuditVerification(False, chained, legacy, True, previous, "invalid audit chain metadata")
+
+        if seq != expected_seq:
+            return AuditVerification(False, chained, legacy, True, previous, f"audit sequence mismatch: expected {expected_seq}, got {seq}")
+        if prev_hash != previous:
+            return AuditVerification(False, chained, legacy, True, previous, "audit previous-hash mismatch")
+        expected = _event_hash(event, previous)
+        if supplied != expected:
+            return AuditVerification(False, chained, legacy, True, previous, "audit record hash mismatch")
+        previous = supplied
+        expected_seq += 1
+        chained += 1
+
+    return AuditVerification(True, chained, legacy, chain_started, previous if chained else None, None)
+
+
+def verify_audit_file(path: Path) -> AuditVerification:
+    target = path.expanduser()
+    if target.is_symlink():
+        return AuditVerification(False, 0, 0, False, error="audit log must not be a symlink")
+    if not target.exists():
+        return AuditVerification(True, 0, 0, False)
+    try:
+        with FileLock(target.with_name(target.name + ".lock")):
+            with target.open("rb") as handle:
+                return _verify_stream(handle)
+    except (OSError, LockError) as exc:
+        return AuditVerification(False, 0, 0, False, error=str(exc))
+
+
 class AuditLogger:
-    """Append-only audit sink held open with no-follow semantics when supported."""
+    """Locked append-only audit sink with a SHA-256 hash chain."""
 
     def __init__(self, path: Path, *, workspace: Path | None = None) -> None:
         self.path = path.expanduser()
@@ -53,7 +145,7 @@ class AuditLogger:
             if common == root:
                 raise OSError("audit log must be outside the MCP workspace")
 
-        flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND
+        flags = os.O_CREAT | os.O_RDWR | os.O_APPEND
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
@@ -70,7 +162,30 @@ class AuditLogger:
         if os.name != "nt":
             os.fchmod(self._fd, 0o600)
 
+        self._lock = FileLock(self.path.with_name(self.path.name + ".lock"))
+        with self._lock:
+            verification = self._verify_locked()
+            if not verification.valid:
+                self.close()
+                raise OSError(f"audit chain verification failed: {verification.error}")
+
+    def _verify_locked(self) -> AuditVerification:
+        duplicate = os.dup(self._fd)
+        try:
+            with os.fdopen(duplicate, "rb", closefd=True) as handle:
+                return _verify_stream(handle)
+        except Exception:
+            try:
+                os.close(duplicate)
+            except OSError:
+                pass
+            raise
+
     def close(self) -> None:
+        lock = getattr(self, "_lock", None)
+        if lock is not None:
+            lock.close()
+            self._lock = None
         fd = getattr(self, "_fd", None)
         if fd is not None:
             os.close(fd)
@@ -79,8 +194,32 @@ class AuditLogger:
     def __del__(self) -> None:
         try:
             self.close()
-        except OSError:
+        except (OSError, LockError):
             pass
+
+    def _chain_state_locked(self) -> tuple[int, str]:
+        verification = self._verify_locked()
+        if not verification.valid:
+            raise OSError(f"audit chain verification failed: {verification.error}")
+        if verification.chained_records:
+            assert verification.last_hash is not None
+            return verification.chained_records + 1, verification.last_hash
+
+        # A v0.1/v0.2 legacy prefix is cryptographically anchored by the first
+        # v0.3 record. Any later modification of the legacy bytes then breaks
+        # the first chained record's prev_hash.
+        duplicate = os.dup(self._fd)
+        try:
+            with os.fdopen(duplicate, "rb", closefd=True) as handle:
+                legacy_bytes = handle.read()
+        except Exception:
+            try:
+                os.close(duplicate)
+            except OSError:
+                pass
+            raise
+        previous = hashlib.sha256(legacy_bytes).hexdigest() if legacy_bytes else _GENESIS_HASH
+        return 1, previous
 
     def record(
         self,
@@ -90,14 +229,26 @@ class AuditLogger:
         outcome: str,
         detail: dict[str, Any] | None = None,
     ) -> None:
-        event = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "request_id": request_id,
-            "tool": tool,
-            "outcome": outcome,
-            "detail": detail or {},
-        }
-        encoded = redact_text(json.dumps(event, ensure_ascii=False, sort_keys=True)).encode("utf-8") + b"\n"
-        if self._fd is None:
+        if self._fd is None or self._lock is None:
             raise OSError("audit log is closed")
-        os.write(self._fd, encoded)
+        with self._lock:
+            seq, previous = self._chain_state_locked()
+            event: dict[str, Any] = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "request_id": request_id,
+                "tool": tool,
+                "outcome": outcome,
+                "detail": detail or {},
+                "audit": {
+                    "v": _AUDIT_CHAIN_VERSION,
+                    "seq": seq,
+                    "prev_hash": previous,
+                },
+            }
+            # Redact before hashing so verification covers exactly the durable
+            # bytes rather than pre-redaction sensitive data.
+            sanitized = json.loads(redact_text(json.dumps(event, ensure_ascii=False)))
+            sanitized["audit"]["hash"] = _event_hash(sanitized, previous)
+            encoded = (json.dumps(sanitized, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+            os.write(self._fd, encoded)
+            os.fsync(self._fd)
