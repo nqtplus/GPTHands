@@ -1,6 +1,6 @@
 # GPTHands Roadmap
 
-## v0.1 — Security-first MCP core
+## v0.1 — Security-first MCP core ✅
 
 - [x] MCP stdio JSON-RPC server
 - [x] Read-only default policy
@@ -18,28 +18,32 @@
 - [x] CI with immutable action SHAs
 - [x] Threat model and security documentation
 
-## v0.2 — OS sandbox and approvals
+## v0.2 — OS sandbox and approvals ✅
 
-- [ ] Linux bubblewrap/namespaces process sandbox
-- [ ] macOS sandbox profile / supported OS isolation strategy
-- [ ] Network egress deny-by-default at OS layer
-- [ ] Per-action risk levels: READ / WRITE / EXEC / NETWORK / DESTRUCTIVE
-- [ ] Human approval token for high-risk operations
-- [ ] Time-limited capability leases
-- [ ] Policy store outside workspace with strict file permissions
-- [ ] Git-specific safe operations instead of generic shell where possible
-- [ ] Safe patch API with preview/diff before write
+- [x] Linux bubblewrap/namespaces process sandbox
+- [x] macOS conservative `sandbox-exec` profile with fail-closed unsupported-backend behavior
+- [x] Network egress deny-by-default at OS layer
+- [x] Per-action risk levels: READ / WRITE / EXEC / NETWORK / DESTRUCTIVE
+- [x] Human approval token for high-risk operations
+- [x] Time-limited capability leases re-evaluated at action time
+- [x] Policy store outside workspace with strict file permissions
+- [x] Git-specific safe read operations instead of generic shell where possible
+- [x] Safe edit API with preview/diff + base hash + one-time preview id before write
+- [x] Persistent approval replay protection across server restarts
+- [x] Real Linux bubblewrap isolation tests in CI
 
 ## v0.3 — Production hardening
 
 - [ ] Tamper-evident chained audit records
+- [ ] Atomic/file-locked approval replay consumption for multi-process use
 - [ ] SBOM generation
 - [ ] Signed release artifacts and checksums
 - [ ] Reproducible build/release pipeline
 - [ ] Dependency/vulnerability scanning
-- [ ] Fuzz MCP parser, path handling, and policy engine
+- [ ] Fuzz MCP parser, path handling, policy/approval engines
 - [ ] Property-based path escape tests
-- [ ] Windows security model
+- [ ] Durable macOS isolation successor strategy as Apple deprecates `sandbox-exec`
+- [ ] Windows security model and OS sandbox
 - [ ] Structured policy schema/version migration
 - [ ] Rate limits and concurrency quotas
 
@@ -49,7 +53,7 @@
 - [ ] Local status/config UI bound to loopback only
 - [ ] Keychain/credential-store integration
 - [ ] Workspace switcher with explicit trust state
-- [ ] Approval notifications
+- [ ] Approval notifications and action-specific approval UX
 - [ ] Health/status diagnostics
 - [ ] Installer/uninstaller with rollback
 
