@@ -7,7 +7,8 @@ import unittest
 from pathlib import Path
 
 from gpthands.sandbox import SandboxRunner
-from gpthands.windows_sandbox import WindowsAppContainerSandbox, build_sandbox_spec
+from gpthands.windows_classic import WindowsAppContainerSandbox
+from gpthands.windows_sandbox import build_sandbox_spec
 
 
 class WindowsSpecTests(unittest.TestCase):
@@ -67,26 +68,46 @@ class WindowsAppContainerIntegrationTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertNotIn(b"HOST_SECRET_SENTINEL", completed.stdout)
 
-    def test_workspace_write_is_denied_then_explicitly_allowed(self) -> None:
+    def test_workspace_acl_is_read_only_then_explicitly_read_write(self) -> None:
         target = self.workspace / "created.txt"
-        completed, _ = self.run_sandbox(["cmd.exe", "/d", "/c", "copy", "/y", "NUL", str(target)], allow_write=False)
-        self.assertFalse(target.exists(), completed.stdout.decode(errors="replace"))
+        command = ["cmd.exe", "/d", "/c", "echo ALLOWED>created.txt"]
 
-        completed, _ = self.run_sandbox(["cmd.exe", "/d", "/c", "copy", "/y", "NUL", str(target)], allow_write=True)
+        completed, _ = self.run_sandbox(command, allow_write=False)
+        self.assertNotEqual(completed.returncode, 0, "read-only AppContainer staging unexpectedly accepted a write")
+        self.assertFalse(target.exists())
+
+        completed, _ = self.run_sandbox(command, allow_write=True)
         self.assertEqual(completed.returncode, 0, completed.stdout.decode(errors="replace"))
         self.assertTrue(target.exists())
+        self.assertIn("ALLOWED", target.read_text(encoding="utf-8"))
 
     def test_network_is_denied_without_capability(self) -> None:
-        script = (
-            "$c=New-Object System.Net.Sockets.TcpClient; "
-            "$a=$c.BeginConnect('1.1.1.1',443,$null,$null); "
-            "if($a.AsyncWaitHandle.WaitOne(2000)){try{$c.EndConnect($a); exit 9}catch{exit 0}}else{exit 0}"
-        )
         completed, _ = self.run_sandbox(
-            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+            [
+                "curl.exe",
+                "--connect-timeout", "2",
+                "--max-time", "3",
+                "--silent",
+                "--show-error",
+                "--head",
+                "https://1.1.1.1/",
+            ],
             allow_network=False,
         )
-        self.assertEqual(completed.returncode, 0, "network connection unexpectedly escaped AppContainer isolation")
+        self.assertNotEqual(completed.returncode, 0, "outbound network unexpectedly escaped AppContainer isolation")
+
+    def test_arbitrary_host_environment_is_not_inherited(self) -> None:
+        secret_name = "GPTHANDS_HOST_SECRET_SENTINEL"
+        old = os.environ.get(secret_name)
+        os.environ[secret_name] = "SHOULD_NOT_LEAK_9471"
+        try:
+            completed, _ = self.run_sandbox(["cmd.exe", "/d", "/c", f"set {secret_name}"])
+        finally:
+            if old is None:
+                os.environ.pop(secret_name, None)
+            else:
+                os.environ[secret_name] = old
+        self.assertNotIn(b"SHOULD_NOT_LEAK_9471", completed.stdout)
 
 
 if __name__ == "__main__":
