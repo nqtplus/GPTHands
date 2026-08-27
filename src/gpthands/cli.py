@@ -19,10 +19,10 @@ from .installer import InstallError, UserInstaller
 from .policy import POLICY_SCHEMA_VERSION, Policy, PolicyError, default_policy_path, migrate_policy_data
 from .risk import RiskLevel
 from .server import serve_stdio
+from .stable_server import V10GPTHandsServer
 from .state import state_root
 from .trust import TrustError, WorkspaceTrustStore
 from .tunnel import TunnelError, build_tunnel_plan, execute_tunnel_step
-from .ux_server import V04GPTHandsServer
 
 
 def default_audit_path() -> Path:
@@ -79,10 +79,10 @@ def _workspace_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="GPTHands secure local MCP bridge")
+    parser = argparse.ArgumentParser(description="GPTHands stable secure local MCP bridge")
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
-    serve = sub.add_parser("serve", help="serve MCP over stdio")
+    serve = sub.add_parser("serve", help="serve MCP over stdio (2026-07-28 + legacy 2025-06-18)")
     _workspace_arg(serve)
     serve.add_argument("--policy", type=Path)
     serve.add_argument("--audit-log", type=Path, default=default_audit_path())
@@ -124,7 +124,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _workspace_arg(untrust)
     sub.add_parser("trust-list", help="list explicitly trusted workspaces")
 
-    cred_backend = sub.add_parser("credential-backend", help="show the OS credential-store backend")
+    sub.add_parser("credential-backend", help="show the OS credential-store backend")
     cred_set = sub.add_parser("credential-set", help="store a secret in the OS credential store")
     cred_set.add_argument("name")
     cred_set.add_argument("--stdin", action="store_true", help="read the secret from stdin")
@@ -161,12 +161,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _tunnel_plan_from_args(args):
-    return build_tunnel_plan(
-        workspace=args.workspace,
-        tunnel_id=args.tunnel_id,
-        profile=args.profile,
-        binary=args.tunnel_client,
-    )
+    return build_tunnel_plan(workspace=args.workspace, tunnel_id=args.tunnel_id, profile=args.profile, binary=args.tunnel_client)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -189,18 +184,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.subcommand == "audit-verify":
             result = verify_audit_file(args.audit_log)
             print(json.dumps({
-                "valid": result.valid,
-                "anchored": result.anchored,
-                "chained_records": result.chained_records,
-                "legacy_records": result.legacy_records,
-                "last_hash": result.last_hash,
-                "error": result.error,
+                "valid": result.valid, "anchored": result.anchored,
+                "chained_records": result.chained_records, "legacy_records": result.legacy_records,
+                "last_hash": result.last_hash, "error": result.error,
             }, indent=2))
             return 0 if result.valid else 2
 
         if args.subcommand == "trust":
-            record = WorkspaceTrustStore().trust(args.workspace, label=args.label)
-            print(json.dumps(record, indent=2, ensure_ascii=False))
+            print(json.dumps(WorkspaceTrustStore().trust(args.workspace, label=args.label), indent=2, ensure_ascii=False))
             return 0
         if args.subcommand == "untrust":
             print("removed" if WorkspaceTrustStore().untrust(args.workspace) else "not-trusted")
@@ -231,19 +222,12 @@ def main(argv: list[str] | None = None) -> int:
             plan = _tunnel_plan_from_args(args)
             if args.subcommand == "tunnel-plan":
                 print(json.dumps({
-                    "profile": plan.profile,
-                    "init": plan.init_argv,
-                    "doctor": plan.doctor_argv,
-                    "run": plan.run_argv,
+                    "profile": plan.profile, "init": plan.init_argv, "doctor": plan.doctor_argv, "run": plan.run_argv,
                     "secret_model": "CONTROL_PLANE_API_KEY is an env reference; literal keys are not written to the profile",
                 }, indent=2))
                 return 0
-            argv = {
-                "tunnel-init": plan.init_argv,
-                "tunnel-doctor": plan.doctor_argv,
-                "tunnel-run": plan.run_argv,
-            }[args.subcommand]
-            completed = execute_tunnel_step(argv, credential_name=args.credential_name, timeout=120 if args.subcommand == "tunnel-run" else 60)
+            argv_value = {"tunnel-init": plan.init_argv, "tunnel-doctor": plan.doctor_argv, "tunnel-run": plan.run_argv}[args.subcommand]
+            completed = execute_tunnel_step(argv_value, credential_name=args.credential_name, timeout=120 if args.subcommand == "tunnel-run" else 60)
             sys.stdout.write(completed.stdout)
             return completed.returncode
 
@@ -269,14 +253,12 @@ def main(argv: list[str] | None = None) -> int:
             expiry = _lease_iso(args.lease_seconds)
             data = {
                 "schema_version": POLICY_SCHEMA_VERSION,
-                "allow_write": bool(args.allow_write),
-                "allow_process": bool(args.allow_process),
+                "allow_write": bool(args.allow_write), "allow_process": bool(args.allow_process),
                 "allow_network_commands": bool(args.allow_network),
                 "write_lease_until": expiry if args.allow_write else None,
                 "process_lease_until": expiry if args.allow_process else None,
                 "network_lease_until": expiry if args.allow_network else None,
-                "allowed_commands": args.allowed_commands,
-                "approval_required_from": args.approval_from,
+                "allowed_commands": args.allowed_commands, "approval_required_from": args.approval_from,
                 "require_os_sandbox": not args.no_require_os_sandbox,
                 "max_requests_per_minute": args.max_requests_per_minute,
                 "max_concurrent_actions": args.max_concurrent_actions,
@@ -307,12 +289,7 @@ def main(argv: list[str] | None = None) -> int:
             workspace = args.workspace.resolve(strict=True)
             manager = ApprovalManager(default_approval_key_path())
             try:
-                token = manager.issue(
-                    workspace=workspace,
-                    risk=RiskLevel.parse(args.risk),
-                    ttl_seconds=args.seconds,
-                    action_hash=args.action_hash,
-                )
+                token = manager.issue(workspace=workspace, risk=RiskLevel.parse(args.risk), ttl_seconds=args.seconds, action_hash=args.action_hash)
             finally:
                 manager.close()
             print(token)
@@ -326,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
         audit = AuditLogger(args.audit_log, workspace=workspace)
         approvals = ApprovalManager(default_approval_key_path())
         try:
-            return serve_stdio(V04GPTHandsServer(policy, audit, approvals=approvals))
+            return serve_stdio(V10GPTHandsServer(policy, audit, approvals=approvals))
         finally:
             audit.close()
             approvals.close()
