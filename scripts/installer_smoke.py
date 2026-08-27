@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -42,9 +43,17 @@ def build(outdir: Path) -> Path:
     return wheels[0]
 
 
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def bootstrap(root: Path, bin_dir: Path, *args: str) -> dict:
     output = run(sys.executable, str(BOOTSTRAP), "--root", str(root), "--bin-dir", str(bin_dir), *args)
     return json.loads(output)
+
+
+def install_args(wheel: Path) -> tuple[str, ...]:
+    return ("install", str(wheel), "--sha256", digest(wheel))
 
 
 def main() -> int:
@@ -65,13 +74,18 @@ def main() -> int:
             pyproject.write_text(original, encoding="utf-8")
         new_wheel = build(new_out)
 
-        first = bootstrap(install_root, bin_dir, "install", str(old_wheel))
+        first = bootstrap(install_root, bin_dir, *install_args(old_wheel))
         assert first["current"] == OLD_VERSION, first
-        second = bootstrap(install_root, bin_dir, "install", str(new_wheel))
+        assert first["digests"][OLD_VERSION] == digest(old_wheel), first
+
+        second = bootstrap(install_root, bin_dir, *install_args(new_wheel))
         assert second["current"] == CURRENT_VERSION and OLD_VERSION in second["history"], second
+        assert second["digests"][CURRENT_VERSION] == digest(new_wheel), second
+
         rolled = bootstrap(install_root, bin_dir, "rollback")
         assert rolled["current"] == OLD_VERSION, rolled
-        final = bootstrap(install_root, bin_dir, "install", str(new_wheel))
+
+        final = bootstrap(install_root, bin_dir, *install_args(new_wheel))
         assert final["current"] == CURRENT_VERSION, final
 
         launcher = Path(final["launcher"])
@@ -84,7 +98,12 @@ def main() -> int:
 
         status = bootstrap(install_root, bin_dir, "status")
         assert status["current"] == CURRENT_VERSION, status
-        print(json.dumps({"ok": True, "current": status["current"], "history": status["history"]}, indent=2))
+        print(json.dumps({
+            "ok": True,
+            "current": status["current"],
+            "history": status["history"],
+            "digest_bound_versions": sorted(status["digests"]),
+        }, indent=2))
     return 0
 
 
