@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 import unittest
@@ -56,12 +55,20 @@ class V04UXTests(unittest.TestCase):
         with self.assertRaises(TunnelError):
             build_tunnel_plan(workspace=self.workspace, tunnel_id="bad", binary=str(fake))
 
-    def test_control_ui_is_hard_bound_to_ipv4_loopback(self) -> None:
+    def test_control_ui_is_hard_bound_to_ipv4_loopback_and_switches_only_to_trusted_workspace(self) -> None:
+        other = self.base / "other"
+        other.mkdir()
         server = create_control_server(self.workspace, port=0)
+        server.trust_store = WorkspaceTrustStore(self.state / "ui-trust.json")
         try:
             self.assertEqual(server.server_address[0], "127.0.0.1")
             self.assertGreater(server.server_address[1], 0)
             self.assertGreaterEqual(len(server.csrf_token), 32)
+            with self.assertRaises(Exception):
+                server.switch_workspace(str(other))
+            server.trust_store.trust(other, label="other")
+            server.switch_workspace(str(other))
+            self.assertEqual(server.workspace, other)
         finally:
             server.server_close()
 
