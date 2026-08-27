@@ -36,20 +36,25 @@
 - [x] Persistent approval replay protection across server restarts
 - [x] Python 3.11–3.14 security regression matrix
 
-## v0.3 — Production hardening
+## v0.3 — Production hardening ✅ for supported execution platforms
 
-- [ ] Tamper-evident chained audit records
-- [ ] Atomic/file-locked approval replay consumption for multi-process use
-- [ ] SBOM generation
-- [ ] Signed release artifacts and checksums
-- [ ] Reproducible build/release pipeline
-- [ ] Dependency/vulnerability scanning
-- [ ] Fuzz MCP parser, path handling, policy/approval engines
-- [ ] Property-based path escape tests
-- [ ] Durable macOS isolation successor strategy as Apple deprecates `sandbox-exec`
-- [ ] Windows security model and OS sandbox
-- [ ] Structured policy schema/version migration
-- [ ] Rate limits and concurrency quotas
+- [x] Tamper-evident SHA-256 chained audit records + startup/manual verification
+- [x] Atomic/file-locked approval replay consumption for multi-process use
+- [x] Deterministic CycloneDX SBOM generation
+- [x] SHA-256 release checksums
+- [x] GitHub/Sigstore build provenance and SBOM attestations; pipeline exercised successfully
+- [x] Reproducible wheel build verified by byte-identical SHA-256 output
+- [x] Dependency/vulnerability scanning with pinned `pip-audit` CI tooling
+- [x] Deterministic fuzzing of MCP shapes, paths, approval tokens, and versioned policy parsing
+- [x] Hypothesis property-based path-escape and token-mutation tests
+- [x] Durable macOS successor strategy and fail-closed migration contract documented
+- [x] Windows fail-closed security posture + staged AppContainer/Job Object design documented and CI-tested
+- [ ] Windows AppContainer OS sandbox implementation and real isolation tests
+- [x] Structured policy schema v3 + legacy migration + unknown-field rejection
+- [x] Per-server rate limits and concurrency/queue quotas
+- [x] Version-consistency regression between package metadata and effective v0.3 server
+
+> Windows generic process execution remains intentionally unavailable when OS sandboxing is required. The missing AppContainer backend is not treated as a completed security feature; see `docs/PLATFORM_HARDENING.md`.
 
 ## v0.4 — ChatGPT integration UX
 
@@ -60,13 +65,14 @@
 - [ ] Approval notifications and action-specific approval UX
 - [ ] Health/status diagnostics
 - [ ] Installer/uninstaller with rollback
+- [ ] Windows AppContainer staged-workspace backend
 
 ## v1.0 — Stable secure local coding bridge
 
 - [ ] External security review
 - [ ] Stable MCP compatibility contract
 - [ ] Cross-platform installers
-- [ ] Signed releases
-- [ ] Hardened OS sandbox on supported platforms
+- [ ] Tagged signed/attested releases
+- [ ] Hardened OS sandbox on all declared supported execution platforms
 - [ ] Documented secure deployment profiles
 - [ ] Upgrade/rollback strategy
