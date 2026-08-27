@@ -49,7 +49,7 @@ jobs:
           print(f'verified release tag {actual}')
           PY
 
-      - name: Reproducible release build
+      - name: Reproducible release build and packaged installers
         run: |
           export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
           export PYTHONHASHSEED=0
@@ -60,13 +60,20 @@ jobs:
           python scripts/compare_artifacts.py dist-a dist-b
           mkdir -p dist
           cp dist-a/* dist/
+          WHEEL="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          python scripts/build_platform_bundles.py --wheel "$WHEEL" --outdir dist
           python scripts/generate_sbom.py --output dist/gpthands.cdx.json
-          python scripts/checksums.py dist/*.whl dist/gpthands.cdx.json --output dist/SHA256SUMS
+          python scripts/checksums.py dist/*.whl dist/*.zip dist/gpthands.cdx.json --output dist/SHA256SUMS
 
-      - name: Attest build provenance with GitHub/Sigstore
+      - name: Attest wheel build provenance with GitHub/Sigstore
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: "dist/*.whl"
+
+      - name: Attest packaged installer provenance with GitHub/Sigstore
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: "dist/*.zip"
 
       - name: Attest CycloneDX SBOM with GitHub/Sigstore
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
