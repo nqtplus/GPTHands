@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,17 +34,53 @@ def content_fingerprint(value: str) -> dict[str, Any]:
 
 
 class AuditLogger:
-    def __init__(self, path: Path) -> None:
+    """Append-only audit sink held open with no-follow semantics when supported."""
+
+    def __init__(self, path: Path, *, workspace: Path | None = None) -> None:
         self.path = path.expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            fd = os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600)
-            os.close(fd)
-        else:
+
+        if self.path.is_symlink():
+            raise OSError("audit log must not be a symlink")
+
+        resolved = self.path.resolve(strict=False)
+        if workspace is not None:
+            root = workspace.expanduser().resolve(strict=True)
             try:
-                os.chmod(self.path, 0o600)
-            except OSError:
-                pass
+                common = Path(os.path.commonpath((str(root), str(resolved))))
+            except ValueError as exc:
+                raise OSError("invalid audit log path") from exc
+            if common == root:
+                raise OSError("audit log must be outside the MCP workspace")
+
+        flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+
+        self._fd = os.open(self.path, flags, 0o600)
+        info = os.fstat(self._fd)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(self._fd)
+            raise OSError("audit log must be a regular file")
+        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+            os.close(self._fd)
+            raise OSError("audit log must be owned by the current user")
+        if os.name != "nt":
+            os.fchmod(self._fd, 0o600)
+
+    def close(self) -> None:
+        fd = getattr(self, "_fd", None)
+        if fd is not None:
+            os.close(fd)
+            self._fd = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except OSError:
+            pass
 
     def record(
         self,
@@ -60,6 +97,7 @@ class AuditLogger:
             "outcome": outcome,
             "detail": detail or {},
         }
-        encoded = redact_text(json.dumps(event, ensure_ascii=False, sort_keys=True))
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(encoded + "\n")
+        encoded = redact_text(json.dumps(event, ensure_ascii=False, sort_keys=True)).encode("utf-8") + b"\n"
+        if self._fd is None:
+            raise OSError("audit log is closed")
+        os.write(self._fd, encoded)
