@@ -49,7 +49,7 @@ class _Server(ThreadingHTTPServer):
 
 
 class ControlHandler(BaseHTTPRequestHandler):
-    server_version = "GPTHandsControl/0.4"
+    server_version = "GPTHandsControl/1.0"
 
     def log_message(self, format: str, *args) -> None:
         return
@@ -67,6 +67,22 @@ class ControlHandler(BaseHTTPRequestHandler):
     def _html(self, body: str, *, status=HTTPStatus.OK) -> None:
         self._headers(status)
         self.wfile.write(("<!doctype html><meta charset=utf-8><title>GPTHands</title>" + body).encode("utf-8"))
+
+    def _require_loopback_host(self) -> None:
+        value = self.headers.get("Host", "").strip()
+        if not value or "@" in value or any(ch in value for ch in "\r\n"):
+            raise ControlUIError("invalid local UI Host header")
+        try:
+            parsed = urllib.parse.urlsplit("//" + value)
+            hostname = (parsed.hostname or "").lower()
+            if parsed.username is not None or parsed.password is not None:
+                raise ValueError("userinfo is not allowed")
+            if parsed.port is not None and not 0 <= parsed.port <= 65535:
+                raise ValueError("invalid port")
+        except ValueError as exc:
+            raise ControlUIError("invalid local UI Host header") from exc
+        if hostname not in {"127.0.0.1", "localhost"}:
+            raise ControlUIError("local UI rejected non-loopback Host header")
 
     def _form(self) -> dict[str, str]:
         try:
@@ -106,6 +122,12 @@ class ControlHandler(BaseHTTPRequestHandler):
         )
 
     def do_GET(self) -> None:
+        try:
+            self._require_loopback_host()
+        except ControlUIError as exc:
+            self._html(f"<h1>Request refused</h1><pre>{html.escape(str(exc))}</pre>", status=HTTPStatus.BAD_REQUEST)
+            return
+
         if self.path == "/api/status":
             report = diagnostic_report(self.server.workspace)
             report["trusted"] = self.server.trust_store.is_trusted(self.server.workspace)
@@ -159,7 +181,7 @@ class ControlHandler(BaseHTTPRequestHandler):
 <style>
 body{{font:14px system-ui;max-width:1040px;margin:36px auto;padding:0 18px;color:#1f2328}}h1{{margin-bottom:4px}}.muted{{color:#667085}}.ok{{color:#067647}}.warn{{color:#b54708}}table{{border-collapse:collapse;width:100%;margin:18px 0}}td,th{{border:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}fieldset{{margin:18px 0;padding:14px}}input,select,button{{padding:8px;margin:4px}}code{{word-break:break-all}}
 </style>
-<h1>GPTHands v0.4 Control</h1>
+<h1>GPTHands v1 Control</h1>
 <p class=muted>Loopback-only local control surface. No credentials or command contents are rendered here.</p>
 <p><strong>Workspace:</strong> <code>{workspace}</code></p>
 <p><strong>Trust:</strong> {'<span class=ok>trusted</span>' if trusted else '<span class=warn>not trusted</span>'}</p>
@@ -181,6 +203,7 @@ body{{font:14px system-ui;max-width:1040px;margin:36px auto;padding:0 18px;color
 
     def do_POST(self) -> None:
         try:
+            self._require_loopback_host()
             form = self._form()
             self._require_csrf(form)
             if self.path == "/trust":
