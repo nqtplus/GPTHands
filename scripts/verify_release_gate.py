@@ -7,12 +7,15 @@ import sys
 import tomllib
 from pathlib import Path
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
+
 from gpthands.release_gate import ReleaseGateError, verify_release_gate
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Verify GPTHands stable-release security-review gate")
-    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--root", type=Path, default=REPOSITORY_ROOT)
     parser.add_argument("--commit", required=True)
     args = parser.parse_args(argv)
 
