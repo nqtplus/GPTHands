@@ -21,6 +21,7 @@ _SECRET_VALUE_PATTERNS = (
 )
 _AUDIT_CHAIN_VERSION = 1
 _GENESIS_HASH = "0" * 64
+_MAX_TAIL_RECORD_BYTES = 1_048_576
 
 
 def redact_text(value: str) -> str:
@@ -197,28 +198,48 @@ class AuditLogger:
         except (OSError, LockError):
             pass
 
-    def _chain_state_locked(self) -> tuple[int, str]:
-        verification = self._verify_locked()
-        if not verification.valid:
-            raise OSError(f"audit chain verification failed: {verification.error}")
-        if verification.chained_records:
-            assert verification.last_hash is not None
-            return verification.chained_records + 1, verification.last_hash
+    def _last_nonempty_line_locked(self) -> bytes | None:
+        with self.path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            if size == 0:
+                return None
+            length = min(size, _MAX_TAIL_RECORD_BYTES)
+            handle.seek(size - length)
+            tail = handle.read(length)
+        rows = [row for row in tail.splitlines() if row.strip()]
+        if not rows:
+            return None
+        if size > _MAX_TAIL_RECORD_BYTES and len(rows) == 1:
+            raise OSError("last audit record exceeds maximum supported tail size")
+        return rows[-1]
 
-        # A v0.1/v0.2 legacy prefix is cryptographically anchored by the first
-        # v0.3 record. Any later modification of the legacy bytes then breaks
-        # the first chained record's prev_hash.
-        duplicate = os.dup(self._fd)
+    def _chain_state_locked(self) -> tuple[int, str]:
+        last_line = self._last_nonempty_line_locked()
+        if last_line is None:
+            return 1, _GENESIS_HASH
+
         try:
-            with os.fdopen(duplicate, "rb", closefd=True) as handle:
-                handle.seek(0)
-                legacy_bytes = handle.read()
-        except Exception:
-            try:
-                os.close(duplicate)
-            except OSError:
-                pass
-            raise
+            event = json.loads(last_line.decode("utf-8"))
+            audit = event.get("audit") if isinstance(event, dict) else None
+            if isinstance(audit, dict) and audit.get("v") == _AUDIT_CHAIN_VERSION:
+                seq = int(audit.get("seq"))
+                prev_hash = str(audit.get("prev_hash"))
+                supplied = str(audit.get("hash"))
+                if len(supplied) != 64 or supplied != _event_hash(event, prev_hash):
+                    raise OSError("last audit record hash is invalid")
+                return seq + 1, supplied
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise OSError("last audit record is malformed") from exc
+
+        # Only a pure v0.1/v0.2 prefix may end in an unchained record. Verify
+        # the entire file once, then anchor the exact legacy bytes. Chained logs
+        # never need a full scan on every append, so steady-state recording is
+        # O(1) in log length while explicit verification remains O(n).
+        verification = self._verify_locked()
+        if not verification.valid or verification.chained_records:
+            raise OSError(f"audit chain verification failed: {verification.error or 'unexpected legacy tail'}")
+        with self.path.open("rb") as handle:
+            legacy_bytes = handle.read()
         previous = hashlib.sha256(legacy_bytes).hexdigest() if legacy_bytes else _GENESIS_HASH
         return 1, previous
 
