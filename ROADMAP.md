@@ -75,9 +75,9 @@ Windows execution uses a private staged workspace and a real AppContainer proces
 
 See `docs/V04_CHATGPT_INTEGRATION.md` for the integration flow and security model.
 
-## v1.0 — Stable secure local coding bridge — RC1 internally verified
+## v1.0 — Stable secure local coding bridge — RC2 internally verified
 
-Current candidate: **`1.0.0rc1`**. Internal implementation and CI gates are complete. Stable `1.0.0` remains blocked on an independent external security review and the final tagged signed/attested release.
+Current candidate: **`1.0.0rc2`**. Internal implementation and security gates are complete. Stable `1.0.0` remains blocked on an independent external security review and the final tagged signed/attested release.
 
 - [ ] External security review by an independent reviewer
 - [x] Stable MCP compatibility contract: current `2026-07-28` + legacy `2025-06-18`
@@ -99,6 +99,14 @@ Current candidate: **`1.0.0rc1`**. Internal implementation and CI gates are comp
 - [x] Same-version wheel substitution refusal + per-version local digest binding
 - [x] Digest-bound rollback marker verification before launcher switch
 - [x] Direct symlink refusal for wheel/install root/bin/releases/version targets and managed installer state
+- [x] Stable MCP stdio input size bound and bounded read/edit/output memory behavior
+- [x] Exact action-bound approvals; no unbound approval-token fallback
+- [x] Executable normalization/path-qualified allowlist bypass protection
+- [x] Local control UI DNS-rebinding Host-header rejection
+- [x] Secure MCP Tunnel output bounds/redaction and minimal environment allowlist
+- [x] OS credential secret-size bound and fail-closed Secret Service helper timeout
+- [x] Static AST security contract rejecting runtime `eval`/`exec`, `os.system`/`os.popen`, unsafe deserialization imports and `shell=True`
+- [x] Stable POSIX atomic writes anchored to opened directory handles with parent-symlink swap and no-clobber race tests
 
 ### Stable-release gate
 

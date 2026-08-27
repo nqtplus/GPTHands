@@ -142,8 +142,8 @@ jobs:
           bom = json.loads(Path('dist/gpthands.cdx.json').read_text())
           assert bom['bomFormat'] == 'CycloneDX'
           assert bom['specVersion'] == '1.6'
-          assert bom['metadata']['component']['version'] == '1.0.0rc1'
-          bundles = sorted(Path('dist').glob('gpthands-1.0.0rc1-*.zip'))
+          assert bom['metadata']['component']['version'] == '1.0.0rc2'
+          bundles = sorted(Path('dist').glob('gpthands-1.0.0rc2-*.zip'))
           assert len(bundles) == 3, bundles
           assert Path('dist/SHA256SUMS').stat().st_size > 0
           PY
@@ -151,7 +151,7 @@ jobs:
       - name: Upload verified supply-chain artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: gpthands-v1.0-rc1-supply-chain
+          name: gpthands-v1.0-rc2-supply-chain
           path: dist/
           if-no-files-found: error
           retention-days: 14

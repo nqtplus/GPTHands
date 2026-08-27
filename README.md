@@ -8,7 +8,7 @@ GPTHands is a local MCP coding bridge that lets an AI assistant inspect, edit, t
 
 > The model proposes actions. GPTHands trust state, external policy, expiring leases, approvals, quotas, audit verification and the OS sandbox decide what is allowed.
 
-## Current status — `1.0.0rc1`
+## Current status — `1.0.0rc2`
 
 The v1 release candidate combines the v0.1–v0.4 security/UX work with the final stable-bridge hardening:
 
@@ -19,15 +19,16 @@ The v1 release candidate combines the v0.1–v0.4 security/UX work with the fina
 - Windows **classic AppContainer + Job Object** stable execution path: process is created suspended, attached/verified in the Job Object, then resumed;
 - process-tree termination on timeout and descendant cleanup rather than only killing the direct child;
 - Windows symlink/junction/reparse-point trees refused before staging and before sync-back;
-- Secure MCP Tunnel helper using the official OpenAI `tunnel-client`;
-- OS-backed credentials with no GPTHands plaintext fallback;
+- stable POSIX writes anchored to an opened directory descriptor to resist parent-symlink swap races and preserve atomic no-clobber semantics;
+- Secure MCP Tunnel helper using the official OpenAI `tunnel-client`, with an explicit runtime environment allowlist so unrelated shell secrets are not inherited;
+- OS-backed credentials with no GPTHands plaintext fallback, bounded credential size and fail-closed helper timeouts;
 - explicit workspace trust and loopback-only local control UI;
 - one-time action-bound approvals and pending-approval UX;
 - tamper-evident audit chain, cross-process replay protection, rate/concurrency limits;
 - reproducible wheels, CycloneDX SBOM, `SHA256SUMS`, vulnerability scan and GitHub/Sigstore attestation workflow;
 - versioned **offline cross-platform installer bundles** with install → upgrade → rollback smoke tests on Linux, macOS and Windows.
 
-`1.0.0rc1` is intentionally a release candidate. The repository will not call `v1.0.0` independently security-reviewed until an external reviewer has completed the review packet in [`docs/EXTERNAL_SECURITY_REVIEW.md`](docs/EXTERNAL_SECURITY_REVIEW.md).
+`1.0.0rc2` is intentionally a release candidate. The repository will not call `v1.0.0` independently security-reviewed until an external reviewer has completed the review packet in [`docs/EXTERNAL_SECURITY_REVIEW.md`](docs/EXTERNAL_SECURITY_REVIEW.md).
 
 ## Architecture
 
@@ -186,9 +187,9 @@ Backends:
 - Windows: Credential Manager;
 - Linux: Secret Service through `secret-tool`.
 
-GPTHands does not use a plaintext fallback.
+GPTHands does not use a plaintext fallback. Credential values have a portable size bound, and external Secret Service helper calls are timeout-bounded and fail closed.
 
-For ChatGPT/private local MCP access, GPTHands delegates transport to the official OpenAI `tunnel-client`. Generated profiles reference `env:CONTROL_PLANE_API_KEY`; GPTHands does not write the literal runtime key into the profile.
+For ChatGPT/private local MCP access, GPTHands delegates transport to the official OpenAI `tunnel-client`. Generated profiles reference `env:CONTROL_PLANE_API_KEY`; GPTHands does not write the literal runtime key into the profile. The tunnel process receives a minimal allowlisted runtime environment rather than inheriting unrelated API keys/tokens from the user's shell.
 
 ```bash
 gpthands credential-set openai-tunnel-runtime
@@ -201,11 +202,11 @@ gpthands tunnel-doctor --workspace /path/to/project --tunnel-id tunnel_012345678
 
 ### Linux
 
-Bubblewrap provides constrained mounts, isolated HOME/TMP, read-only workspace without a write lease and network namespace isolation by default. Timeout cleanup targets the full process group, and unsupported namespace enforcement fails closed.
+Bubblewrap provides constrained mounts, isolated HOME/TMP, read-only workspace without a write lease and network namespace isolation by default. Timeout cleanup targets the full process group, and unsupported namespace enforcement fails closed. Stable host-side writes use an opened directory descriptor plus no-follow/no-clobber operations so a parent path swapped to a symlink after validation cannot redirect the final commit outside that directory handle.
 
 ### macOS
 
-A conservative `sandbox-exec`/Seatbelt compatibility profile is exercised on real macOS CI. Commands also run in a separate process group so timeout cleanup terminates descendants. Because the public Seatbelt facility is deprecated, the durable successor plan remains documented rather than hidden.
+A conservative `sandbox-exec`/Seatbelt compatibility profile is exercised on real macOS CI. Commands also run in a separate process group so timeout cleanup terminates descendants. Stable host-side writes use the same dirfd-anchored POSIX commit primitive. Because the public Seatbelt facility is deprecated, the durable successor plan remains documented rather than hidden.
 
 ### Windows
 
@@ -220,7 +221,7 @@ The v1 stable execution path uses **classic AppContainer + private staged worksp
 7. close/terminate the Job Object to clean the complete process tree;
 8. re-scan staging for reparse points before any authorized sync-back.
 
-Network capability is omitted by default, host environment variables are sanitized, and the real repository is not directly granted AppContainer ACLs.
+Network capability is omitted by default, host environment variables are sanitized, and the real repository is not directly granted AppContainer ACLs. Host-side atomic writes revalidate the canonical parent identity immediately before commit; model-controlled commands operate on private staging rather than racing the host repository path directly.
 
 ## Packaged install, upgrade and rollback
 
@@ -245,8 +246,10 @@ CI/release tooling verifies or produces:
 ```text
 Python 3.11–3.14 security + MCP compatibility tests
 + deterministic fuzzing
++ static AST runtime security contract
 + Hypothesis properties
 + Linux/macOS/Windows real sandbox tests
++ parent-symlink swap race tests for stable POSIX writes
 + cross-platform installer upgrade/rollback smoke
 + pip-audit
 + reproducible wheel build
@@ -276,7 +279,7 @@ See:
 
 ## Release state
 
-**`1.0.0rc1` is an internally tested release candidate, not yet an independently reviewed stable `v1.0.0` release.** Stable promotion remains gated by external security review and a verified signed/attested tag release.
+**`1.0.0rc2` is an internally tested release candidate, not yet an independently reviewed stable `v1.0.0` release.** Stable promotion remains gated by external security review and a verified signed/attested tag release.
 
 ## License
 

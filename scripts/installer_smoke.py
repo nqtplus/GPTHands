@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP = ROOT / "scripts" / "release_bootstrap.py"
-CURRENT_VERSION = "1.0.0rc1"
+CURRENT_VERSION = "1.0.0rc2"
 OLD_VERSION = "0.9.999"
 
 

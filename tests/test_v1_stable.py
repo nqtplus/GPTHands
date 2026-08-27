@@ -19,7 +19,7 @@ from gpthands.stable_server import (
     V10GPTHandsServer,
 )
 
-EXPECTED_VERSION = "1.0.0rc1"
+EXPECTED_VERSION = "1.0.0rc2"
 
 
 class V10StableTests(unittest.TestCase):
