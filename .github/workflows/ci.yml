@@ -102,14 +102,14 @@ jobs:
           bom = json.loads(Path('dist/gpthands.cdx.json').read_text())
           assert bom['bomFormat'] == 'CycloneDX'
           assert bom['specVersion'] == '1.6'
-          assert bom['metadata']['component']['version'] == '0.3.0'
+          assert bom['metadata']['component']['version'] == '0.4.0'
           assert Path('dist/SHA256SUMS').stat().st_size > 0
           PY
 
       - name: Upload verified supply-chain artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: gpthands-v0.3-supply-chain
+          name: gpthands-v0.4-supply-chain
           path: dist/
           if-no-files-found: error
           retention-days: 14
@@ -188,7 +188,7 @@ jobs:
       - name: Require native AppContainer SandboxEngine
         shell: pwsh
         run: |
-          python -c "from gpthands.windows_sandbox import WindowsAppContainerSandbox; assert WindowsAppContainerSandbox.available(), 'processmodel.dll SandboxEngine API unavailable'"
+          python -c "from gpthands.windows_sandbox import WindowsAppContainerSandbox; assert WindowsAppContainerSandbox.available(), 'native AppContainer backend unavailable'"
 
       - name: Real Windows AppContainer isolation tests
         run: python -m unittest discover -s tests -p 'test_windows_security.py' -v
