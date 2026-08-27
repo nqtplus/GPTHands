@@ -8,6 +8,7 @@ from pathlib import Path
 
 from . import windows_sandbox as ws
 from .windows_job import WindowsJobError, WindowsJobObject
+from .windows_paths import WindowsPathError, assert_no_reparse_tree
 
 _CREATE_SUSPENDED = 0x00000004
 
@@ -36,6 +37,10 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
     ) -> ws.WindowsSandboxResult:
         if not self._classic_available:
             raise ws.WindowsSandboxError("stable classic Windows AppContainer backend is unavailable")
+        try:
+            assert_no_reparse_tree(workspace)
+        except WindowsPathError as exc:
+            raise ws.WindowsSandboxError(str(exc)) from exc
         return self._run_classic(
             command=command,
             workspace=workspace,
@@ -147,6 +152,10 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
         scratch = isolated_home / "scratch"
         scratch.mkdir(parents=True, exist_ok=True)
         shutil.copytree(workspace, staged, symlinks=True, dirs_exist_ok=True)
+        try:
+            assert_no_reparse_tree(staged)
+        except WindowsPathError as exc:
+            raise ws.WindowsSandboxError(str(exc)) from exc
         staged_cwd = staged / cwd.relative_to(workspace)
 
         mapped = ws._map_workspace_args(command, workspace, staged)
@@ -232,6 +241,10 @@ class WindowsAppContainerSandbox(ws.WindowsAppContainerSandbox):
                 output = ws._read_output(output_handle, max_output_bytes)
 
             if allow_write:
+                try:
+                    assert_no_reparse_tree(staged)
+                except WindowsPathError as exc:
+                    raise ws.WindowsSandboxError(str(exc)) from exc
                 ws._sync_stage_back(staged, workspace)
             return ws.WindowsSandboxResult(returncode, output, "windows-appcontainer-classic-job")
         finally:
