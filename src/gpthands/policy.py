@@ -1,92 +1,111 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import re
 import stat
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+from .risk import RiskLevel, classify_command
 
 
 class PolicyError(RuntimeError):
     """Raised when a requested action violates local GPTHands policy."""
 
 
-_SECRET_NAME_PATTERNS = (
-    re.compile(r"^\.env(?:\..+)?$", re.IGNORECASE),
-    re.compile(r".*\.(?:pem|key|p12|pfx)$", re.IGNORECASE),
-    re.compile(r"^(?:id_rsa|id_ed25519|credentials|credentials\.json|service-account\.json)$", re.IGNORECASE),
-    re.compile(r"^\.git-credentials$", re.IGNORECASE),
-)
-
+_SECRET_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
+_SECRET_NAMES = {
+    ".env",
+    "id_rsa",
+    "id_ed25519",
+    "credentials",
+    "credentials.json",
+    "service-account.json",
+    ".git-credentials",
+}
 _SECRET_DIR_NAMES = {".ssh", ".aws", ".gnupg"}
-_PROTECTED_NAMES = {".gpthands.json"}
+_PROTECTED_NAMES = {".gpthands.json", ".gpthands-policy.json"}
 
-_DANGEROUS_ARG_PATTERNS = (
-    re.compile(r"(^|\s)--privileged($|\s)"),
-    re.compile(r"(^|\s)--force($|\s)"),
-    re.compile(r"(^|\s)-f($|\s)"),
-    re.compile(r"(^|\s)reset\s+--hard($|\s)"),
-    re.compile(r"(^|\s)clean\s+-[^\s]*f"),
-)
 
-_NETWORK_PROGRAMS = {
-    "curl",
-    "wget",
-    "nc",
-    "netcat",
-    "ssh",
-    "scp",
-    "sftp",
-    "ftp",
-    "telnet",
-}
+def _workspace_id(workspace: Path) -> str:
+    return hashlib.sha256(str(workspace.resolve(strict=True)).encode("utf-8")).hexdigest()[:24]
 
-_NETWORK_SUBCOMMANDS = {
-    "git": {"clone", "fetch", "pull", "push", "ls-remote"},
-    "npm": {"install", "i", "update", "audit", "publish", "login", "whoami"},
-    "pnpm": {"install", "add", "update", "publish", "audit"},
-    "yarn": {"install", "add", "upgrade", "publish", "npm"},
-    "pip": {"install", "download", "index"},
-    "pip3": {"install", "download", "index"},
-    "cargo": {"fetch", "install", "publish", "search", "login"},
-    "go": {"get", "install"},
-}
+
+def default_policy_path(workspace: Path) -> Path:
+    root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return root / "gpthands" / "policies" / f"{_workspace_id(workspace)}.json"
+
+
+def _inside(root: Path, candidate: Path) -> bool:
+    try:
+        return os.path.commonpath((str(root), str(candidate))) == str(root)
+    except ValueError:
+        return False
+
+
+def _parse_expiry(value: object, *, name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise PolicyError(f"{name} must be an ISO-8601 timestamp or unix time") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    raise PolicyError(f"{name} must be an ISO-8601 timestamp or unix time")
 
 
 @dataclass(frozen=True)
 class Policy:
     workspace: Path
+    policy_path: Path
     allow_write: bool = False
     allow_process: bool = False
     allow_network_commands: bool = False
+    require_os_sandbox: bool = True
+    approval_required_from: RiskLevel = RiskLevel.NETWORK
     allowed_commands: tuple[str, ...] = field(default_factory=tuple)
     max_read_bytes: int = 1_000_000
     max_write_bytes: int = 1_000_000
     max_command_seconds: int = 30
     max_output_bytes: int = 200_000
+    write_lease_until: float | None = None
+    process_lease_until: float | None = None
+    network_lease_until: float | None = None
 
     @staticmethod
-    def load(workspace: Path) -> "Policy":
+    def load(workspace: Path, policy_path: Path | None = None) -> "Policy":
         root = workspace.expanduser().resolve(strict=True)
         if not root.is_dir():
             raise PolicyError(f"workspace is not a directory: {root}")
 
-        config_path = root / ".gpthands.json"
+        path = (policy_path or default_policy_path(root)).expanduser().resolve(strict=False)
+        if _inside(root, path):
+            raise PolicyError("policy authority must live outside the workspace")
+
         raw: dict[str, object] = {}
-        if config_path.exists():
-            if config_path.is_symlink():
-                raise PolicyError(".gpthands.json must not be a symlink")
-            config_stat = config_path.stat()
-            if os.name != "nt" and config_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-                raise PolicyError(".gpthands.json must not be group/world writable")
-            if hasattr(os, "geteuid") and config_stat.st_uid != os.geteuid():
-                raise PolicyError(".gpthands.json must be owned by the current user")
+        if path.exists():
+            if path.is_symlink():
+                raise PolicyError("policy file must not be a symlink")
+            info = path.stat()
+            if os.name != "nt":
+                if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                    raise PolicyError("policy file permissions must be 0600")
+                if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+                    raise PolicyError("policy file must be owned by current user")
             try:
-                raw = json.loads(config_path.read_text(encoding="utf-8"))
+                raw = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                raise PolicyError(f"invalid .gpthands.json: {exc}") from exc
+                raise PolicyError(f"invalid policy file: {exc}") from exc
 
         allowed = raw.get("allowed_commands", [])
         if not isinstance(allowed, list) or not all(isinstance(x, str) and x for x in allowed):
@@ -106,16 +125,49 @@ class Policy:
                 raise PolicyError(f"{name} must be between {minimum} and {maximum}")
             return value
 
+        now = time.time()
+        write_exp = _parse_expiry(raw.get("write_lease_until"), name="write_lease_until")
+        process_exp = _parse_expiry(raw.get("process_lease_until"), name="process_lease_until")
+        network_exp = _parse_expiry(raw.get("network_lease_until"), name="network_lease_until")
+
+        write_enabled = bool_value("allow_write", False)
+        process_enabled = bool_value("allow_process", False)
+        network_enabled = bool_value("allow_network_commands", False)
+
+        # Mutable capabilities are lease-bound in v0.2. Missing/expired lease => disabled.
+        effective_write = write_enabled and write_exp is not None and write_exp > now
+        effective_process = process_enabled and process_exp is not None and process_exp > now
+        effective_network = (
+            network_enabled
+            and effective_process
+            and network_exp is not None
+            and network_exp > now
+        )
+
+        approval_raw = raw.get("approval_required_from", "NETWORK")
+        if not isinstance(approval_raw, str):
+            raise PolicyError("approval_required_from must be a risk level string")
+        try:
+            approval_level = RiskLevel.parse(approval_raw)
+        except ValueError as exc:
+            raise PolicyError(str(exc)) from exc
+
         return Policy(
             workspace=root,
-            allow_write=bool_value("allow_write", False),
-            allow_process=bool_value("allow_process", False),
-            allow_network_commands=bool_value("allow_network_commands", False),
+            policy_path=path,
+            allow_write=effective_write,
+            allow_process=effective_process,
+            allow_network_commands=effective_network,
+            require_os_sandbox=bool_value("require_os_sandbox", True),
+            approval_required_from=approval_level,
             allowed_commands=tuple(allowed),
             max_read_bytes=int_value("max_read_bytes", 1_000_000, 1, 20_000_000),
             max_write_bytes=int_value("max_write_bytes", 1_000_000, 1, 20_000_000),
             max_command_seconds=int_value("max_command_seconds", 30, 1, 600),
             max_output_bytes=int_value("max_output_bytes", 200_000, 1_000, 5_000_000),
+            write_lease_until=write_exp,
+            process_lease_until=process_exp,
+            network_lease_until=network_exp,
         )
 
     def resolve_path(self, target: str, *, must_exist: bool = False) -> Path:
@@ -126,11 +178,7 @@ class Policy:
             raise PolicyError("absolute paths are not allowed")
 
         candidate = (self.workspace / requested).resolve(strict=must_exist)
-        try:
-            common = Path(os.path.commonpath((str(self.workspace), str(candidate))))
-        except ValueError as exc:
-            raise PolicyError("path is outside workspace") from exc
-        if common != self.workspace:
+        if not _inside(self.workspace, candidate):
             raise PolicyError("path escapes workspace")
 
         self._check_protected_path(candidate)
@@ -139,11 +187,14 @@ class Policy:
 
     def require_write(self) -> None:
         if not self.allow_write:
-            raise PolicyError("write capability is disabled by local policy")
+            raise PolicyError("write capability is disabled or its lease expired")
 
-    def validate_command(self, argv: Iterable[str]) -> list[str]:
+    def approval_required(self, risk: RiskLevel) -> bool:
+        return risk >= self.approval_required_from
+
+    def validate_command(self, argv: Iterable[str]) -> tuple[list[str], RiskLevel]:
         if not self.allow_process:
-            raise PolicyError("process capability is disabled by local policy")
+            raise PolicyError("process capability is disabled or its lease expired")
 
         args = list(argv)
         if not args or not all(isinstance(x, str) and x for x in args):
@@ -153,18 +204,10 @@ class Policy:
         if program not in self.allowed_commands:
             raise PolicyError(f"command is not allowlisted: {program}")
 
-        if not self.allow_network_commands:
-            if program in _NETWORK_PROGRAMS:
-                raise PolicyError(f"network-capable command is disabled: {program}")
-            if len(args) > 1 and args[1].lower() in _NETWORK_SUBCOMMANDS.get(program, set()):
-                raise PolicyError(f"network-capable subcommand is disabled: {program} {args[1]}")
-
-        joined = " ".join(args).lower()
-        for pattern in _DANGEROUS_ARG_PATTERNS:
-            if pattern.search(joined):
-                raise PolicyError("dangerous command arguments require a future approval flow")
-
-        return args
+        risk = classify_command(args)
+        if risk == RiskLevel.NETWORK and not self.allow_network_commands:
+            raise PolicyError("network capability is disabled or its lease expired")
+        return args, risk
 
     @staticmethod
     def _check_protected_path(path: Path) -> None:
@@ -177,11 +220,10 @@ class Policy:
         if lowered_parts.intersection(_SECRET_DIR_NAMES):
             raise PolicyError("access to secret directory is denied")
 
-        name = path.name
-        if any(pattern.match(name) for pattern in _SECRET_NAME_PATTERNS):
+        name = path.name.lower()
+        if name in _SECRET_NAMES or name.startswith(".env.") or path.suffix.lower() in _SECRET_SUFFIXES:
             raise PolicyError("access to secret-like file is denied")
 
-        # Block common credential files inside .config without denying all .config usage.
         lower = str(path).lower().replace("\\", "/")
         if "/.config/gcloud/" in lower or "/.config/gh/hosts.yml" in lower:
             raise PolicyError("access to credential path is denied")
