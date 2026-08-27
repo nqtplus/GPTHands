@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "status": "approved",
+  "version": "1.0.0",
+  "reviewed_commit": "0000000000000000000000000000000000000000",
+  "reviewer": "Independent reviewer or firm name",
+  "independent_reviewer_attested": true,
+  "completed_at": "2026-01-01T00:00:00Z",
+  "report_url": "https://example.com/gpthands-v1-security-review",
+  "critical_open": 0,
+  "high_open": 0,
+  "notes": "Template only. Copy to docs/reviews/v1.0.0.json only after the final commit has actually been independently reviewed."
+}
