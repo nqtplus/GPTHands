@@ -1,16 +1,16 @@
 # GPTHands v0.4 — ChatGPT Integration UX
 
-v0.4 turns the v0.3 security core into a practical local integration surface without moving authority into the repository.
+v0.4 turns the v0.3 security core into a practical local integration surface without moving authority into repository content.
 
 ## Security model
 
 - A workspace must be explicitly trusted before `gpthands serve` starts by default.
-- Trust state, approval keys, audit logs, credential references and installer metadata live outside the workspace.
+- Trust state, approval keys, pending approval metadata, audit logs, credential references and installer metadata live outside the workspace.
 - The local control UI binds only to `127.0.0.1` and uses a per-process CSRF token for mutations.
 - Secrets are stored only in an OS credential store. GPTHands has no plaintext credential fallback.
 - Secure MCP Tunnel profiles reference `env:CONTROL_PLANE_API_KEY`; literal API keys are not written into tunnel profiles.
 - Approval tokens are short-lived, one-time and may be bound to an exact action hash.
-- Missing approval tokens trigger a best-effort local desktop notification without exposing command content or secrets.
+- Missing approval tokens create a minimal pending request and trigger a best-effort local desktop notification without exposing command content or secrets.
 
 ## First-use flow
 
@@ -90,9 +90,9 @@ gpthands tunnel-run \
   --credential-name openai-tunnel-runtime
 ```
 
-The generated profile uses a local stdio MCP command and health listener `127.0.0.1:0`.
+The generated profile uses a local stdio MCP command and health listener `127.0.0.1:0`. The runtime key is injected only into the `tunnel-client` process environment from the OS credential store.
 
-## Workspace trust
+## Workspace trust and switcher
 
 ```bash
 gpthands trust --workspace /path/to/repo
@@ -102,17 +102,41 @@ gpthands untrust --workspace /path/to/repo
 
 The identity is the SHA-256 of the canonical workspace path. Repository files cannot self-authorize trust.
 
-## Approval UX
+The loopback UI lists trusted workspaces and can switch only to a canonical path already present in the external trust store. A path supplied by the browser cannot become trusted merely by selecting it.
 
-The local UI can issue one-time approval tokens bound to a 64-character action SHA-256. The server also emits a local notification when an action reaches a configured approval threshold without a token.
+## Pending approval UX
 
-The notification contains only:
+When a configured approval threshold is reached without an approval token, GPTHands stores a minimal pending request outside the repository. The queue contains only:
+
+- canonical workspace identity/path;
+- risk class;
+- exact action SHA-256;
+- first/last-seen timestamps.
+
+It does **not** store command arguments, file content, model prompts, tool output, credentials or approval tokens.
+
+The same event triggers a best-effort desktop notification containing only:
 
 - workspace basename;
 - risk class;
 - a short action-hash prefix.
 
-It does not include command arguments, file content or credentials.
+The loopback UI displays the exact pending action hash and provides an `Approve 5 min` action. Before issuing the token the server re-reads the pending queue for the currently selected workspace; a browser-supplied hash that is no longer pending is refused. The resulting token remains one-time, short-lived and bound to that exact action hash.
+
+Manual action-bound approval remains available for advanced use.
+
+## Local UI boundary
+
+The local UI is deliberately not a general network service:
+
+- bind address is hard-coded to `127.0.0.1`;
+- default port is OS-selected (`0`);
+- mutations require a per-process CSRF token;
+- responses use `Cache-Control: no-store`;
+- framing is denied;
+- referrer leakage is disabled;
+- CSP allows no remote script or resource loading;
+- stored credentials are never rendered.
 
 ## Diagnostics
 
