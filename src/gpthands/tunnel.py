@@ -5,9 +5,11 @@ import re
 import shlex
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from .audit import redact_text
 from .credentials import CredentialStore, CredentialStoreError
 
 
@@ -16,6 +18,8 @@ class TunnelError(RuntimeError):
 
 
 _TUNNEL_ID = re.compile(r"^tunnel_[0-9a-f]{32}$")
+_MAX_TUNNEL_OUTPUT_BYTES = 1_000_000
+_TRUNCATED = "\n[output truncated by GPTHands tunnel policy]"
 
 
 @dataclass(frozen=True)
@@ -74,32 +78,97 @@ def build_tunnel_plan(*, workspace: Path, tunnel_id: str, profile: str = "gpthan
     )
 
 
-def _runtime_env(credential_name: str | None) -> dict[str, str]:
+def _runtime_env(credential_name: str | None) -> tuple[dict[str, str], str | None]:
     env = dict(os.environ)
+    secret: str | None = None
     if credential_name:
         try:
-            env["CONTROL_PLANE_API_KEY"] = CredentialStore().get(credential_name)
+            secret = CredentialStore().get(credential_name)
+            env["CONTROL_PLANE_API_KEY"] = secret
         except CredentialStoreError as exc:
             raise TunnelError(str(exc)) from exc
-    return env
+    return env, secret
 
 
-def execute_tunnel_step(argv: list[str], *, credential_name: str | None = None, timeout: int | None = 60) -> subprocess.CompletedProcess[str]:
+def _redact_tunnel_output(text: str, secret: str | None) -> str:
+    if secret:
+        text = text.replace(secret, "[REDACTED]")
+    return redact_text(text)
+
+
+def execute_tunnel_step(
+    argv: list[str],
+    *,
+    credential_name: str | None = None,
+    timeout: int | None = 60,
+) -> subprocess.CompletedProcess[str]:
     if not argv:
         raise TunnelError("empty tunnel command")
     effective_timeout = None if len(argv) > 1 and argv[1] == "run" else timeout
+    env, secret = _runtime_env(credential_name)
+
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             argv,
-            env=_runtime_env(credential_name),
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
+            text=False,
             shell=False,
-            timeout=effective_timeout,
-            check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise TunnelError(f"tunnel-client execution failed: {exc}") from exc
-    return completed
+
+    if process.stdout is None:  # pragma: no cover - guaranteed by PIPE
+        process.kill()
+        raise TunnelError("tunnel-client stdout pipe was not created")
+
+    retained = bytearray()
+    truncated = [False]
+    read_error: list[BaseException] = []
+
+    def drain() -> None:
+        try:
+            while True:
+                chunk = process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                remaining = _MAX_TUNNEL_OUTPUT_BYTES - len(retained)
+                if remaining > 0:
+                    retained.extend(chunk[:remaining])
+                if len(chunk) > max(remaining, 0):
+                    truncated[0] = True
+        except (OSError, ValueError) as exc:
+            read_error.append(exc)
+
+    reader = threading.Thread(target=drain, name="gpthands-tunnel-output", daemon=True)
+    reader.start()
+    try:
+        process.wait(timeout=effective_timeout)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        reader.join(timeout=5)
+        raise TunnelError("tunnel-client execution timed out") from exc
+
+    reader.join(timeout=5)
+    if reader.is_alive():
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
+        reader.join(timeout=1)
+    if reader.is_alive():
+        raise TunnelError("tunnel-client output drain did not terminate")
+    if read_error:
+        raise TunnelError(f"tunnel-client output capture failed: {type(read_error[0]).__name__}")
+
+    output = retained.decode("utf-8", errors="replace")
+    if truncated[0]:
+        output += _TRUNCATED
+    output = _redact_tunnel_output(output, secret)
+    return subprocess.CompletedProcess(argv, int(process.returncode), stdout=output, stderr=None)
