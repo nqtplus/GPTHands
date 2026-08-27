@@ -6,79 +6,91 @@
 
 GPTHands is a local MCP coding bridge that lets an AI assistant inspect, edit, test and run code inside a selected workspace while keeping authority outside both the model and the repository.
 
-> The model proposes actions. GPTHands trust state, policy, leases, approvals, quotas, audit verification and the OS sandbox decide what is allowed.
+> The model proposes actions. GPTHands trust state, external policy, expiring leases, approvals, quotas, audit verification and the OS sandbox decide what is allowed.
 
-## v0.4 highlights
+## Current status — `1.0.0rc1`
 
-v0.4 adds a practical ChatGPT integration layer on top of the hardened v0.3 core:
+The v1 release candidate combines the v0.1–v0.4 security/UX work with the final stable-bridge hardening:
 
-- explicit workspace trust outside repository content;
-- trusted-workspace switcher;
-- local status/config UI hard-bound to `127.0.0.1`;
-- per-process CSRF token and restrictive browser security headers;
-- OS-backed credential storage with **no plaintext fallback**;
-- Secure MCP Tunnel helper that delegates transport to the official OpenAI `tunnel-client`;
-- tunnel profiles reference `env:CONTROL_PLANE_API_KEY` instead of writing literal keys;
-- local approval notifications that do not expose command arguments, file content or credentials;
-- external pending-approval queue containing only risk + exact action hash metadata;
-- one-click action-bound, one-time approval UX;
-- health/security diagnostics;
-- user-level launcher install/uninstall with backup and rollback;
-- real Windows AppContainer staged-workspace isolation with CI enforcement tests;
-- Python 3.11–3.14 security matrix, Linux/macOS/Windows sandbox tests, property tests and reproducible supply-chain build checks.
+- modern MCP `2026-07-28` stateless discovery/request support;
+- legacy MCP `2025-06-18` initialize compatibility for older clients;
+- explicit stable `1.x` MCP/tool compatibility contract;
+- Linux bubblewrap, macOS Seatbelt compatibility sandbox and Windows AppContainer isolation;
+- Windows **classic AppContainer + Job Object** stable execution path: process is created suspended, attached/verified in the Job Object, then resumed;
+- process-tree termination on timeout and descendant cleanup rather than only killing the direct child;
+- Windows symlink/junction/reparse-point trees refused before staging and before sync-back;
+- Secure MCP Tunnel helper using the official OpenAI `tunnel-client`;
+- OS-backed credentials with no GPTHands plaintext fallback;
+- explicit workspace trust and loopback-only local control UI;
+- one-time action-bound approvals and pending-approval UX;
+- tamper-evident audit chain, cross-process replay protection, rate/concurrency limits;
+- reproducible wheels, CycloneDX SBOM, `SHA256SUMS`, vulnerability scan and GitHub/Sigstore attestation workflow;
+- versioned **offline cross-platform installer bundles** with install → upgrade → rollback smoke tests on Linux, macOS and Windows.
 
-The package and effective server version are `0.4.0`.
+`1.0.0rc1` is intentionally a release candidate. The repository will not call `v1.0.0` independently security-reviewed until an external reviewer has completed the review packet in [`docs/EXTERNAL_SECURITY_REVIEW.md`](docs/EXTERNAL_SECURITY_REVIEW.md).
 
 ## Architecture
 
 ```text
 ChatGPT / MCP client
         |
-        | private local connection when needed
+        | optional private transport
         v
-Official Secure MCP Tunnel client
+Official Secure MCP Tunnel
         |
         v
-+-----------------------------+
-| GPTHands v0.4 MCP Server    |
-+-------------+---------------+
-              |
-     +--------+---------+
-     | Explicit trust   |
-     | Policy schema v3 |
-     | Risk + leases    |
-     | Rate/concurrency |
-     +--------+---------+
-              |
-         high risk?
-          /     \
-        yes      no
-         |        |
-         v        |
- pending approval queue
- + local notification
- + action-bound token
-          \      /
-           v    v
-+-----------------------------+
-| OS Sandbox Runner           |
-| Linux: bubblewrap           |
-| macOS: Seatbelt compat      |
-| Windows: AppContainer       |
-+-------------+---------------+
-              |
-              v
-     isolated/staged workspace
-              |
-              v
-     tamper-evident audit
++------------------------------+
+| GPTHands v1 MCP Server       |
+| modern + legacy compatibility|
++---------------+--------------+
+                |
+      +---------+----------+
+      | Workspace trust    |
+      | External policy v3 |
+      | Risk + leases      |
+      | Rate/concurrency   |
+      +---------+----------+
+                |
+           high risk?
+            /      \
+          yes       no
+           |         |
+           v         |
+ pending approval + one-time
+ action-bound token
+            \       /
+             v     v
++------------------------------+
+| OS sandbox / process tree    |
+| Linux: bubblewrap            |
+| macOS: Seatbelt compat       |
+| Windows: AppContainer + Job  |
++---------------+--------------+
+                |
+                v
+      isolated/staged workspace
+                |
+                v
+       tamper-evident audit
 ```
 
-Repository content is treated as untrusted data. It cannot grant itself trust, extend a lease, issue an approval token or change the external policy authority.
+Repository content is untrusted data. It cannot grant trust, extend a lease, create an approval, change credential authority or disable the sandbox.
+
+## MCP compatibility
+
+### Current — `2026-07-28`
+
+GPTHands supports the stateless modern model including `server/discover`, response server identity metadata and JSON Schema 2020-12 tool schemas. Modern requests do **not** require the old initialize handshake.
+
+### Legacy — `2025-06-18`
+
+Older clients can continue to use `initialize`. Security behavior is identical in both protocol eras; client metadata is compatibility data, never authorization data.
+
+See [`docs/MCP_COMPATIBILITY.md`](docs/MCP_COMPATIBILITY.md).
 
 ## MCP tools
 
-Read-only/core:
+Read/core:
 
 - `workspace_info`
 - `read_file`
@@ -90,11 +102,11 @@ Read-only/core:
 
 Mutable:
 
-- `apply_edit` — matching one-time preview + live write lease;
-- `write_file` — live write lease; existing-file overwrite may be `DESTRUCTIVE`;
-- `run_command` — process lease, executable allowlist, risk/approval checks, quotas and OS sandbox.
+- `apply_edit` — matching preview/base hash + live write lease;
+- `write_file` — live write lease; destructive overwrite may require approval;
+- `run_command` — executable allowlist, process/network leases, risk/approval checks, quotas and OS sandbox.
 
-## Install
+## Developer install
 
 Requires Python 3.11+.
 
@@ -104,7 +116,7 @@ cd GPTHands
 python -m pip install -e .
 ```
 
-Linux secure process execution additionally requires bubblewrap, for example:
+Linux secure execution additionally requires bubblewrap, for example:
 
 ```bash
 sudo apt-get install bubblewrap
@@ -112,55 +124,19 @@ sudo apt-get install bubblewrap
 
 ## Recommended first-use flow
 
-Explicitly trust the canonical workspace first:
-
 ```bash
 gpthands trust --workspace /path/to/project
-```
-
-Create a read-only/default external policy:
-
-```bash
 gpthands init-policy --workspace /path/to/project
-```
-
-Check the local security/integration state:
-
-```bash
 gpthands doctor --workspace /path/to/project
-```
-
-Open the local control UI:
-
-```bash
 gpthands ui --workspace /path/to/project
-```
-
-The UI binds only to a random port on `127.0.0.1` by default. It does not render stored credentials.
-
-Start the MCP stdio server:
-
-```bash
 gpthands serve --workspace /path/to/project
 ```
 
-`serve` refuses an untrusted workspace by default. `--allow-untrusted` exists only as an explicit compatibility override and is not the recommended integration path.
+`serve` refuses an untrusted workspace by default. The local UI binds only to a random `127.0.0.1` port.
 
-## Workspace trust
+## Capability leases
 
-```bash
-gpthands trust --workspace /path/to/project
-gpthands trust-list
-gpthands untrust --workspace /path/to/project
-```
-
-Workspace identity is derived from the SHA-256 of the canonical resolved path. Trust state is stored outside the repository.
-
-The local UI can switch only to workspaces already present in this trust store.
-
-## Grant a short capability lease
-
-Authority belongs outside the repository:
+Example local build/test lease without network:
 
 ```bash
 gpthands init-policy \
@@ -171,47 +147,26 @@ gpthands init-policy \
   --command git
 ```
 
-Network is a separate capability:
+Network is a separate capability and should generally have a shorter lease:
 
 ```bash
 gpthands init-policy \
   --workspace /path/to/project \
-  --lease-seconds 600 \
+  --lease-seconds 300 \
   --allow-process \
   --allow-network \
   --command git
 ```
 
-Operational quotas are bounded independently:
+`.gpthands.example.json` is documentation only and is not authority.
 
-```bash
-gpthands init-policy \
-  --workspace /path/to/project \
-  --max-requests-per-minute 120 \
-  --max-concurrent-actions 4 \
-  --max-queue-seconds 2
-```
+See [`docs/SECURE_DEPLOYMENT_PROFILES.md`](docs/SECURE_DEPLOYMENT_PROFILES.md) for recommended operating modes.
 
-Migrate an older supported policy:
+## Approvals
 
-```bash
-gpthands migrate-policy --workspace /path/to/project
-```
+When an action crosses the configured approval threshold, GPTHands keeps it denied until a valid token is supplied. The external pending queue stores only workspace identity, risk, exact action hash and time metadata; it does not store command/file content or credentials.
 
-`.gpthands.example.json` is documentation only and is never trusted authority.
-
-## Human approvals
-
-Generic execution defaults to requiring approval from `EXEC` and above.
-
-When an action needs approval and no token is supplied, v0.4:
-
-1. records a pending request outside the repository using only workspace identity, risk and exact action hash;
-2. emits a best-effort local desktop notification containing only workspace basename, risk and a short hash prefix;
-3. shows the exact pending action in the loopback UI;
-4. lets the user issue a short-lived, one-time token bound to that exact action.
-
-Manual CLI approval remains available:
+Manual exact-action approval remains available:
 
 ```bash
 gpthands approve \
@@ -221,21 +176,9 @@ gpthands approve \
   --action-hash <64-char-sha256>
 ```
 
-Approval tokens are signed, short-lived, workspace/risk bound, optionally exact-action bound and single-use. Replay state is consumed atomically under a cross-process lock.
+Tokens are HMAC-signed, short-lived, workspace/risk/action bound, single-use and atomically replay-protected across processes.
 
-## OS credential store
-
-Show the selected backend:
-
-```bash
-gpthands credential-backend
-```
-
-Store a secret without placing it in a GPTHands plaintext file:
-
-```bash
-gpthands credential-set openai-tunnel-runtime
-```
+## OS credential store and Secure MCP Tunnel
 
 Backends:
 
@@ -243,142 +186,97 @@ Backends:
 - Windows: Credential Manager;
 - Linux: Secret Service through `secret-tool`.
 
-If no supported backend exists, GPTHands fails the credential operation instead of falling back to plaintext.
+GPTHands does not use a plaintext fallback.
 
-## Secure MCP Tunnel
-
-GPTHands does **not** reimplement OpenAI's tunnel transport. The helper builds and executes commands for the official `tunnel-client` binary.
-
-Preview the exact setup without writing a profile:
+For ChatGPT/private local MCP access, GPTHands delegates transport to the official OpenAI `tunnel-client`. Generated profiles reference `env:CONTROL_PLANE_API_KEY`; GPTHands does not write the literal runtime key into the profile.
 
 ```bash
-gpthands tunnel-plan \
-  --workspace /path/to/project \
-  --tunnel-id tunnel_0123456789abcdef0123456789abcdef
+gpthands credential-set openai-tunnel-runtime
+gpthands tunnel-plan --workspace /path/to/project --tunnel-id tunnel_0123456789abcdef0123456789abcdef
+gpthands tunnel-init --workspace /path/to/project --tunnel-id tunnel_0123456789abcdef0123456789abcdef --credential-name openai-tunnel-runtime
+gpthands tunnel-doctor --workspace /path/to/project --tunnel-id tunnel_0123456789abcdef0123456789abcdef --credential-name openai-tunnel-runtime
 ```
-
-Create/update the profile using an OS-stored runtime key:
-
-```bash
-gpthands tunnel-init \
-  --workspace /path/to/project \
-  --tunnel-id tunnel_0123456789abcdef0123456789abcdef \
-  --credential-name openai-tunnel-runtime
-```
-
-Validate it:
-
-```bash
-gpthands tunnel-doctor \
-  --workspace /path/to/project \
-  --tunnel-id tunnel_0123456789abcdef0123456789abcdef \
-  --credential-name openai-tunnel-runtime
-```
-
-Run the long-lived tunnel client:
-
-```bash
-gpthands tunnel-run \
-  --workspace /path/to/project \
-  --tunnel-id tunnel_0123456789abcdef0123456789abcdef \
-  --credential-name openai-tunnel-runtime
-```
-
-Generated profiles use `env:CONTROL_PLANE_API_KEY`, a local stdio MCP command and a loopback health listener (`127.0.0.1:0`). Literal runtime keys are not written into the generated profile by GPTHands.
-
-See [`docs/V04_CHATGPT_INTEGRATION.md`](docs/V04_CHATGPT_INTEGRATION.md).
-
-## Health diagnostics
-
-```bash
-gpthands doctor --workspace /path/to/project
-```
-
-Checks include:
-
-- Python/platform;
-- explicit workspace trust;
-- policy state;
-- OS sandbox backend;
-- tamper-evident audit chain;
-- OS credential-store backend;
-- official `tunnel-client` availability.
-
-## Local UX launcher install and rollback
-
-```bash
-gpthands install-user
-gpthands uninstall-user
-```
-
-The installer creates user-level `gpthands-ui` and `gpthands-doctor` launchers. If a target launcher already exists it is backed up first, and uninstall restores the backup from an external install manifest. Symlink launcher targets are refused.
-
-## Audit verification
-
-The default audit log is outside the workspace. Verify it explicitly with:
-
-```bash
-gpthands audit-verify
-```
-
-The SHA-256 chain is **tamper-evident, not tamper-proof**. It detects broken internal links; independently proving that the newest tail was not truncated still requires an external checkpoint/anchor.
 
 ## Platform isolation
 
 ### Linux
 
-Bubblewrap provides constrained mounts, isolated HOME/TMP, read-only workspace without a write lease and network namespace isolation by default. CI exercises both fail-closed behavior and real RO/RW + network isolation.
+Bubblewrap provides constrained mounts, isolated HOME/TMP, read-only workspace without a write lease and network namespace isolation by default. Timeout cleanup targets the full process group, and unsupported namespace enforcement fails closed.
 
 ### macOS
 
-The current compatibility backend uses a conservative `sandbox-exec`/Seatbelt profile and real macOS integration tests. Because the public facility is deprecated, GPTHands retains a documented fail-closed successor strategy rather than treating it as a permanent interface.
+A conservative `sandbox-exec`/Seatbelt compatibility profile is exercised on real macOS CI. Commands also run in a separate process group so timeout cleanup terminates descendants. Because the public Seatbelt facility is deprecated, the durable successor plan remains documented rather than hidden.
 
 ### Windows
 
-Windows generic process execution now uses a **real AppContainer boundary** with a private staged workspace.
+The v1 stable execution path uses **classic AppContainer + private staged workspace + Job Object**:
 
-Current properties include:
+1. reject symlinks/junctions/reparse points;
+2. copy the workspace into private staging;
+3. apply RO/RW AppContainer ACLs according to the live lease;
+4. create the AppContainer process **suspended**;
+5. attach it to an owner-side Job Object and verify membership;
+6. resume execution;
+7. close/terminate the Job Object to clean the complete process tree;
+8. re-scan staging for reparse points before any authorized sync-back.
 
-- real repository is not directly ACL-granted to the sandbox identity;
-- staged workspace receives AppContainer ACLs;
-- workspace is read-only when no live write capability exists;
-- write-enabled staging synchronizes changes back only after sandbox completion;
-- outside-workspace reads are denied;
-- network is denied without an explicit AppContainer network capability;
-- child environment is sanitized;
-- Windows 11 SandboxEngine is preferred when available;
-- classic AppContainer is used as the native fallback on supported Windows Server/desktop hosts.
+Network capability is omitted by default, host environment variables are sanitized, and the real repository is not directly granted AppContainer ACLs.
 
-Windows CI launches a real AppContainer child and verifies startup/output, workspace reads, outside-read denial, RO/RW behavior, network denial and environment isolation.
+## Packaged install, upgrade and rollback
 
-## Supply-chain checks
-
-CI verifies:
+Release bundles contain the wheel plus a stdlib bootstrap installer. Installation is side-by-side and offline:
 
 ```text
-Python 3.11–3.14 security suite
-+ deterministic fuzzing
-+ Hypothesis properties
-+ pip-audit
-+ reproducible wheel build
-+ CycloneDX 1.6 SBOM
-+ SHA256SUMS
-+ Linux/macOS/Windows sandbox integration
+install old -> install new -> smoke-test new -> atomically switch launcher
+                                      |
+                                      +-> failure: keep old launcher
 ```
 
-The release workflow additionally creates GitHub/Sigstore build-provenance and SBOM attestations. A tagged release is accepted only when `vX.Y.Z` exactly matches the package version.
+A rollback smoke-tests the previous installed version before switching the launcher back.
 
-## Security model and limitations
+CI performs a real `install old → install current → rollback → install current` sequence on Ubuntu, macOS and Windows.
 
-Repository content, prompts, generated commands, dependencies and tool output are untrusted data and cannot create authority. Strong process security depends on a supported OS sandbox; GPTHands fails closed by default rather than silently dropping to an unsandboxed process.
+See [`docs/UPGRADE_ROLLBACK.md`](docs/UPGRADE_ROLLBACK.md).
 
-v0.4 does not claim that a successful CI suite replaces an external security audit. Packaged cross-platform installers, external security review, stable compatibility contract and tagged stable release remain v1.0 work.
+## Supply-chain and release gates
 
-See [SECURITY.md](SECURITY.md), [THREAT_MODEL.md](THREAT_MODEL.md), [ROADMAP.md](ROADMAP.md), [Platform Hardening](docs/PLATFORM_HARDENING.md), and [v0.4 ChatGPT Integration](docs/V04_CHATGPT_INTEGRATION.md).
+CI/release tooling verifies or produces:
 
-## Status
+```text
+Python 3.11–3.14 security + MCP compatibility tests
++ deterministic fuzzing
++ Hypothesis properties
++ Linux/macOS/Windows real sandbox tests
++ cross-platform installer upgrade/rollback smoke
++ pip-audit
++ reproducible wheel build
++ deterministic platform bundles
++ CycloneDX 1.6 SBOM
++ SHA256SUMS
++ GitHub/Sigstore provenance/attestation workflow
+```
 
-**v0.4 is implemented and CI-verified on the declared test matrix.** This statement does not by itself mean a tagged `v0.4.0` GitHub Release has been created.
+The release workflow requires a tag to match the package version and is prepared to attest both wheel and installer ZIP artifacts.
+
+## Audit and residual risks
+
+The audit chain is **tamper-evident, not tamper-proof**. Without an independent external checkpoint, deleting the newest log tail cannot be proven solely from the remaining file.
+
+Other declared residual risks include heuristic secret redaction and the deprecated macOS Seatbelt compatibility interface. CI and an internal threat model are not substitutes for independent review.
+
+See:
+
+- [`SECURITY.md`](SECURITY.md)
+- [`THREAT_MODEL.md`](THREAT_MODEL.md)
+- [`ROADMAP.md`](ROADMAP.md)
+- [`docs/EXTERNAL_SECURITY_REVIEW.md`](docs/EXTERNAL_SECURITY_REVIEW.md)
+- [`docs/MCP_COMPATIBILITY.md`](docs/MCP_COMPATIBILITY.md)
+- [`docs/SECURE_DEPLOYMENT_PROFILES.md`](docs/SECURE_DEPLOYMENT_PROFILES.md)
+- [`docs/UPGRADE_ROLLBACK.md`](docs/UPGRADE_ROLLBACK.md)
+
+## Release state
+
+**`1.0.0rc1` is an internally tested release candidate, not yet an independently reviewed stable `v1.0.0` release.** Stable promotion remains gated by external security review and a verified signed/attested tag release.
 
 ## License
 
