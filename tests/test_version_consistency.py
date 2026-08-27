@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 import gpthands
-from gpthands.ux_server import V04GPTHandsServer
+from gpthands.stable_server import V10GPTHandsServer
 
 
 class VersionConsistencyTests(unittest.TestCase):
@@ -13,7 +13,7 @@ class VersionConsistencyTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         version = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
         self.assertEqual(gpthands.__version__, version)
-        self.assertEqual(V04GPTHandsServer.VERSION, version)
+        self.assertEqual(V10GPTHandsServer.VERSION, version)
 
 
 if __name__ == "__main__":
