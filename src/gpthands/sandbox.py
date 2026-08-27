@@ -8,7 +8,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .windows_sandbox import WindowsAppContainerSandbox, WindowsSandboxError
+from .windows_classic import WindowsAppContainerSandbox
+from .windows_sandbox import WindowsSandboxError
 
 
 class SandboxError(RuntimeError):
@@ -67,13 +68,11 @@ class SandboxRunner:
                 )
         elif system == "windows":
             if WindowsAppContainerSandbox.available():
-                # Windows uses a native process-creation API rather than an
-                # argv wrapper. `run()` dispatches to it directly.
                 return SandboxPlan(backend="windows-appcontainer", argv=command)
 
         if self.require_os_sandbox:
             raise SandboxError(
-                "OS sandbox is required but unavailable; install bubblewrap on Linux, use a supported macOS sandbox-exec environment, or use Windows 11 with the AppContainer SandboxEngine API"
+                "OS sandbox is required but unavailable; install bubblewrap on Linux, use a supported macOS sandbox-exec environment, or use Windows with AppContainer support"
             )
         return SandboxPlan(backend="policy-only", argv=command)
 
@@ -148,8 +147,6 @@ class SandboxRunner:
 
         if plan.backend == "bubblewrap" and completed.returncode != 0:
             diagnostic = completed.stdout.decode("utf-8", errors="replace").strip()
-            # Bubblewrap setup failures happen before the target program starts.
-            # Treat them as a failed security boundary rather than command output.
             if diagnostic.startswith("bwrap:"):
                 if not allow_network and (
                     "loopback" in diagnostic
