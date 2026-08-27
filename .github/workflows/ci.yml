@@ -59,6 +59,30 @@ jobs:
       - name: Property-based security tests
         run: python -m unittest discover -s tests -p 'test_properties.py' -v
 
+  installer-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: ""
+
+      - name: Install pinned offline build toolchain
+        run: python -m pip install --disable-pip-version-check 'build==1.5.0' 'setuptools==84.0.0' 'wheel==0.48.0'
+
+      - name: Real install upgrade rollback smoke
+        run: python scripts/installer_smoke.py
+
   supply-chain:
     runs-on: ubuntu-24.04
     steps:
@@ -92,10 +116,14 @@ jobs:
           mkdir -p dist
           cp dist-a/* dist/
 
+      - name: Build deterministic platform installer bundles
+        run: |
+          python scripts/build_platform_bundles.py --wheel "$(find dist -maxdepth 1 -name '*.whl' -print -quit)" --outdir dist
+
       - name: Generate deterministic CycloneDX SBOM and checksums
         run: |
           python scripts/generate_sbom.py --output dist/gpthands.cdx.json
-          python scripts/checksums.py dist/*.whl dist/gpthands.cdx.json --output dist/SHA256SUMS
+          python scripts/checksums.py dist/*.whl dist/*.zip dist/gpthands.cdx.json --output dist/SHA256SUMS
           python - <<'PY'
           import json
           from pathlib import Path
@@ -103,6 +131,8 @@ jobs:
           assert bom['bomFormat'] == 'CycloneDX'
           assert bom['specVersion'] == '1.6'
           assert bom['metadata']['component']['version'] == '1.0.0'
+          bundles = sorted(Path('dist').glob('gpthands-1.0.0-*.zip'))
+          assert len(bundles) == 3, bundles
           assert Path('dist/SHA256SUMS').stat().st_size > 0
           PY
 
