@@ -1,0 +1,166 @@
+name: CodeQL RC3 Audit
+
+on:
+  push:
+    branches: ["audit/codeql-v1.0.0rc3"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  codeql:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout audit branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Prove runtime tree matches frozen RC3
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASELINE="6d9524e809fa56419d73dccfd27324c8c1c0e3dc"
+          git cat-file -e "$BASELINE^{commit}"
+          changed="$(git diff --name-only "$BASELINE" HEAD -- ':!.github/workflows/codeql-rc3.yml')"
+          if [ -n "$changed" ]; then
+            printf 'Audit branch diverged from frozen RC3 runtime:\n%s\n' "$changed" >&2
+            exit 1
+          fi
+          echo "Runtime matches frozen RC3 baseline $BASELINE"
+
+      - name: Prove accepted chmod finding is still the exact adversarial fixture
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('tests/test_security.py').read_text(encoding='utf-8')
+          fixture = '''    def test_policy_must_be_mode_600(self) -> None:\n        if os.name == "nt":\n            self.skipTest("POSIX permission semantics")\n        self.write_policy()\n        os.chmod(self.policy_path, 0o644)\n        with self.assertRaises(PolicyError):\n            self.load()\n'''
+          if fixture not in text:
+              raise SystemExit('expected RC3 insecure-permission rejection fixture changed or disappeared')
+          print('Verified exact adversarial chmod fixture: chmod 0644 must be rejected by Policy.load')
+          PY
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4, pinned 2026-08-26
+        with:
+          languages: python
+          queries: security-extended,security-and-quality
+
+      - name: Analyze Python security
+        id: analyze
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4, pinned 2026-08-26
+        with:
+          category: "/language:python/rc3-audit"
+          output: codeql-sarif
+          upload: always
+          wait-for-processing: true
+
+      - name: Summarize SARIF and block unwaived High/Critical findings
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path('codeql-sarif')
+          files = sorted(root.rglob('*.sarif'))
+          if not files:
+              raise SystemExit('CodeQL produced no SARIF files')
+
+          rows = []
+          accepted_fixtures = []
+          blockers = []
+          for path in files:
+              doc = json.loads(path.read_text(encoding='utf-8'))
+              for run in doc.get('runs', []):
+                  rules = {}
+                  driver = run.get('tool', {}).get('driver', {})
+                  for rule in driver.get('rules', []) or []:
+                      rid = rule.get('id')
+                      if rid:
+                          rules[rid] = rule
+                  for ext in run.get('tool', {}).get('extensions', []) or []:
+                      for rule in ext.get('rules', []) or []:
+                          rid = rule.get('id')
+                          if rid:
+                              rules.setdefault(rid, rule)
+
+                  for result in run.get('results', []) or []:
+                      rid = result.get('ruleId', '<unknown>')
+                      rule = rules.get(rid, {})
+                      props = dict(rule.get('properties') or {})
+                      props.update(result.get('properties') or {})
+                      raw_score = props.get('security-severity')
+                      try:
+                          score = float(raw_score) if raw_score is not None else None
+                      except (TypeError, ValueError):
+                          score = None
+                      level = result.get('level') or rule.get('defaultConfiguration', {}).get('level') or 'warning'
+                      message = (result.get('message') or {}).get('text', '').replace('\n', ' ')[:500]
+                      location = '<unknown>'
+                      locs = result.get('locations') or []
+                      if locs:
+                          phys = (locs[0].get('physicalLocation') or {})
+                          uri = ((phys.get('artifactLocation') or {}).get('uri'))
+                          line = ((phys.get('region') or {}).get('startLine'))
+                          if uri:
+                              location = f"{uri}:{line}" if line else uri
+                      row = {
+                          'rule': rid,
+                          'security_severity': score,
+                          'level': level,
+                          'location': location,
+                          'message': message,
+                      }
+                      rows.append(row)
+
+                      high_or_critical = score is not None and score >= 7.0
+                      exact_verified_fixture = (
+                          high_or_critical
+                          and rid == 'py/overly-permissive-file'
+                          and location == 'tests/test_security.py:114'
+                          and message == 'Overly permissive mask in chmod sets file to world readable.'
+                      )
+                      if exact_verified_fixture:
+                          accepted_fixtures.append({
+                              **row,
+                              'disposition': (
+                                  'intentional adversarial security test: changes policy mode to 0644 and '
+                                  'asserts GPTHands rejects it with PolicyError; frozen RC3 source fixture was '
+                                  'verified before CodeQL initialization'
+                              ),
+                          })
+                      elif high_or_critical:
+                          blockers.append(row)
+
+          print(json.dumps({
+              'sarif_files': [str(p) for p in files],
+              'finding_count': len(rows),
+              'accepted_security_fixture_count': len(accepted_fixtures),
+              'high_or_critical_blocker_count': len(blockers),
+              'accepted_security_fixtures': accepted_fixtures,
+              'blockers': blockers,
+              'findings': rows,
+          }, indent=2, ensure_ascii=False))
+
+          if blockers:
+              raise SystemExit(f'CodeQL release gate blocked: {len(blockers)} unwaived High/Critical finding(s)')
+          if len(accepted_fixtures) != 1:
+              raise SystemExit(
+                  f'CodeQL fixture contract changed: expected exactly 1 verified chmod fixture, got {len(accepted_fixtures)}'
+              )
+          print('CodeQL RC3 gate: 0 unwaived High/Critical findings; 1 exact adversarial chmod fixture disposition verified')
+          PY
+
+      - name: Preserve CodeQL SARIF evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codeql-v1.0.0rc3-sarif
+          path: codeql-sarif/
+          if-no-files-found: error
+          retention-days: 30
