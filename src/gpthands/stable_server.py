@@ -31,7 +31,7 @@ class V10GPTHandsServer(V04GPTHandsServer):
     Security authority is never derived from client metadata in either era.
     """
 
-    VERSION = "1.0.0rc2"
+    VERSION = "1.0.0rc3"
 
     @staticmethod
     def _server_info_meta() -> dict[str, Any]:

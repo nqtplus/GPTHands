@@ -7,6 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
+from gpthands import __version__ as EXPECTED_VERSION
 from gpthands.approval import ApprovalManager
 from gpthands.audit import AuditLogger
 from gpthands.policy import Policy
@@ -18,8 +19,6 @@ from gpthands.stable_server import (
     SERVER_INFO_META_KEY,
     V10GPTHandsServer,
 )
-
-EXPECTED_VERSION = "1.0.0rc2"
 
 
 class V10StableTests(unittest.TestCase):

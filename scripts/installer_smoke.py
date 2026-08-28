@@ -8,11 +8,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP = ROOT / "scripts" / "release_bootstrap.py"
-CURRENT_VERSION = "1.0.0rc2"
+CURRENT_VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 OLD_VERSION = "0.9.999"
 
 
