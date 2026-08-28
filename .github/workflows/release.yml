@@ -2,26 +2,64 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
   workflow_dispatch:
 
+# Read-only is the workflow-wide default. Write authority is granted only to the
+# attestation and publishing jobs that need it.
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
-  artifact-metadata: write
+  contents: read
 
 jobs:
-  release:
+  detect:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      stable: ${{ steps.version.outputs.stable }}
+      should-release: ${{ steps.version.outputs.should_release }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # Stable promotion verification needs the externally reviewed baseline
-          # so the workflow can prove no unauthorized files changed afterwards.
+          fetch-depth: 1
+
+      - name: Detect package/release state
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          python - <<'PY'
+          import os, re, tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version']
+          stable = bool(re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version))
+          should_release = stable or os.environ['REF_TYPE'] == 'tag' or os.environ['EVENT_NAME'] == 'workflow_dispatch'
+          output = Path(os.environ['GITHUB_OUTPUT'])
+          with output.open('a', encoding='utf-8') as handle:
+              handle.write(f'version={version}\n')
+              handle.write(f"stable={'true' if stable else 'false'}\n")
+              handle.write(f"should_release={'true' if should_release else 'false'}\n")
+          print(f'version={version} stable={stable} should_release={should_release}')
+          PY
+
+  verify-build:
+    needs: detect
+    if: needs.detect.outputs.should-release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Stable promotion verification needs the reviewed baseline history.
           fetch-depth: 0
 
       - name: Setup Python
@@ -43,7 +81,7 @@ jobs:
           python - <<'PY'
           import os, tomllib
           from pathlib import Path
-          version = tomllib.loads(Path('pyproject.toml').read_text())['project']['version']
+          version = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version']
           expected = f'v{version}'
           actual = os.environ['RELEASE_TAG']
           if actual != expected:
@@ -51,7 +89,7 @@ jobs:
           print(f'verified release tag {actual}')
           PY
 
-      - name: Enforce external security-review gate for stable releases
+      - name: Enforce independent security-review gate for stable releases
         env:
           RELEASE_COMMIT: ${{ github.sha }}
         run: python scripts/verify_release_gate.py --commit "$RELEASE_COMMIT"
@@ -72,6 +110,30 @@ jobs:
           python scripts/generate_sbom.py --output dist/gpthands.cdx.json
           python scripts/checksums.py dist/*.whl dist/*.zip dist/gpthands.cdx.json --output dist/SHA256SUMS
 
+      - name: Upload verified release inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gpthands-release-artifacts
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  attest:
+    needs: [detect, verify-build]
+    if: needs.detect.outputs.should-release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download verified release inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: gpthands-release-artifacts
+          path: dist
+
       - name: Attest wheel build provenance with GitHub/Sigstore
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
@@ -88,20 +150,41 @@ jobs:
           subject-path: "dist/*.whl"
           sbom-path: "dist/gpthands.cdx.json"
 
-      - name: Upload signed release inputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+  publish-release:
+    needs: [detect, verify-build, attest]
+    if: github.ref_type == 'tag' || (github.ref_type == 'branch' && needs.detect.outputs.stable == 'true')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download attested release inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: gpthands-release-artifacts
-          path: dist/
-          if-no-files-found: error
+          path: dist
 
-      - name: Create GitHub Release from verified tag
-        if: github.ref_type == 'tag'
+      - name: Publish verified stable release/tag
         env:
           GH_TOKEN: ${{ github.token }}
+          PACKAGE_VERSION: ${{ needs.detect.outputs.version }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --generate-notes \
-            --title "GPTHands $GITHUB_REF_NAME"
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --generate-notes \
+              --title "GPTHands $TAG"
+          else
+            TAG="v${PACKAGE_VERSION}"
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "release $TAG already exists; refusing duplicate promotion" >&2
+              exit 1
+            fi
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --generate-notes \
+              --title "GPTHands $TAG"
+          fi
