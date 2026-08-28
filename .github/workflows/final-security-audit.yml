@@ -1,0 +1,221 @@
+name: Final v1.0 RC3 Security Audit
+
+on:
+  push:
+    branches:
+      - "audit/final-v1.0.0-rc3"
+
+permissions:
+  contents: read
+
+jobs:
+  tree-guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Prove runtime tree is frozen RC3
+        env:
+          REVIEWED_BASELINE: 6d9524e809fa56419d73dccfd27324c8c1c0e3dc
+        run: |
+          git cat-file -e "$REVIEWED_BASELINE^{commit}"
+          git diff --name-only "$REVIEWED_BASELINE"...HEAD > /tmp/changed.txt
+          python - <<'PY'
+          from pathlib import Path
+          changed = {line.strip() for line in Path('/tmp/changed.txt').read_text().splitlines() if line.strip()}
+          allowed = {'.github/workflows/final-security-audit.yml'}
+          unexpected = changed - allowed
+          missing = allowed - changed
+          if unexpected or missing:
+              raise SystemExit(f'RC3 tree guard failed: unexpected={sorted(unexpected)} missing={sorted(missing)}')
+          print('RC3 runtime tree verified; only final audit workflow differs')
+          PY
+
+  semgrep:
+    needs: tree-guard
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: ""
+      - name: Install pinned Semgrep
+        run: python -m pip install --disable-pip-version-check 'semgrep==1.175.0'
+      - name: Scan repository with Semgrep Community rules
+        run: semgrep scan --config auto --json --output semgrep.json .
+      - name: Enforce Semgrep blocking severity
+        run: |
+          python - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+          data = json.loads(Path('semgrep.json').read_text())
+          results = data.get('results', [])
+          severities = Counter(str(item.get('extra', {}).get('severity', 'UNKNOWN')).upper() for item in results)
+          blocking = [item for item in results if str(item.get('extra', {}).get('severity', '')).upper() == 'ERROR']
+          summary = {
+              'semgrep_version': '1.175.0',
+              'total_findings': len(results),
+              'severity_counts': dict(sorted(severities.items())),
+              'blocking_error_findings': len(blocking),
+          }
+          Path('semgrep-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+          print(json.dumps(summary, indent=2))
+          if blocking:
+              for item in blocking[:50]:
+                  extra = item.get('extra', {})
+                  start = item.get('start', {})
+                  print(f"BLOCK {item.get('check_id')} {item.get('path')}:{start.get('line')} {extra.get('message', '')}")
+              raise SystemExit('Semgrep ERROR-severity findings block v1.0.0')
+          PY
+      - name: Upload Semgrep evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: v1-rc3-semgrep-evidence
+          path: |
+            semgrep.json
+            semgrep-summary.json
+          if-no-files-found: error
+          retention-days: 30
+
+  secret-history:
+    needs: tree-guard
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout complete Git history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install verified Gitleaks v8.30.1 binary
+        run: |
+          curl --fail --silent --show-error --location \
+            --output gitleaks.tar.gz \
+            'https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz'
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz' | sha256sum --check --strict
+          mkdir -p /tmp/gitleaks-bin
+          tar -xzf gitleaks.tar.gz -C /tmp/gitleaks-bin gitleaks
+          /tmp/gitleaks-bin/gitleaks version
+      - name: Scan all Git history for secrets
+        run: |
+          /tmp/gitleaks-bin/gitleaks git --redact --report-format json --report-path gitleaks.json --exit-code 1 .
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path('gitleaks.json')
+          findings = json.loads(p.read_text()) if p.exists() and p.stat().st_size else []
+          summary = {'gitleaks_version': '8.30.1', 'history_findings': len(findings)}
+          Path('gitleaks-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+          print(json.dumps(summary, indent=2))
+          if findings:
+              raise SystemExit('secret findings block v1.0.0')
+          PY
+      - name: Upload secret-scan evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: v1-rc3-gitleaks-evidence
+          path: |
+            gitleaks.json
+            gitleaks-summary.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  scorecard:
+    needs: tree-guard
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install verified OpenSSF Scorecard v5.5.0 CLI
+        run: |
+          curl --fail --silent --show-error --location \
+            --output scorecard.tar.gz \
+            'https://github.com/ossf/scorecard/releases/download/v5.5.0/scorecard_5.5.0_linux_amd64.tar.gz'
+          echo '83b90a05c1540ef1390db1cd5711e5fd04be9c1d8537fb84d39d02092d6a8dff  scorecard.tar.gz' | sha256sum --check --strict
+          mkdir -p /tmp/scorecard-bin
+          tar -xzf scorecard.tar.gz -C /tmp/scorecard-bin scorecard
+          /tmp/scorecard-bin/scorecard version
+      - name: Prove default branch is frozen RC3 and scan it
+        env:
+          GITHUB_AUTH_TOKEN: ${{ github.token }}
+        run: |
+          DEFAULT_SHA="$(git ls-remote https://github.com/nqtplus/GPTHands.git refs/heads/main | cut -f1)"
+          test "$DEFAULT_SHA" = '6d9524e809fa56419d73dccfd27324c8c1c0e3dc'
+          /tmp/scorecard-bin/scorecard --repo=github.com/nqtplus/GPTHands --format=json > scorecard.json
+      - name: Enforce release-relevant Scorecard checks
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('scorecard.json').read_text())
+          checks = {item.get('name'): item for item in data.get('checks', [])}
+          required = {
+              'Dangerous-Workflow': 8,
+              'Token-Permissions': 8,
+              'Pinned-Dependencies': 8,
+              'Vulnerabilities': 8,
+          }
+          failures = []
+          selected = {}
+          for name, minimum in required.items():
+              item = checks.get(name)
+              if item is None:
+                  failures.append(f'{name}: missing')
+                  continue
+              score = item.get('score')
+              selected[name] = {'score': score, 'reason': item.get('reason')}
+              if not isinstance(score, (int, float)) or score < minimum:
+                  failures.append(f'{name}: score={score}, required>={minimum}')
+          summary = {
+              'scorecard_version': '5.5.0',
+              'scanned_repo': 'github.com/nqtplus/GPTHands',
+              'expected_default_branch_sha': '6d9524e809fa56419d73dccfd27324c8c1c0e3dc',
+              'overall_score': data.get('score'),
+              'blocking_checks': selected,
+              'failures': failures,
+              'note': 'Overall score and non-blocking governance checks remain evidence; stable gate focuses on checks directly tied to executable/release security.',
+          }
+          Path('scorecard-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+          print(json.dumps(summary, indent=2))
+          if failures:
+              raise SystemExit('OpenSSF release checks failed: ' + '; '.join(failures))
+          PY
+      - name: Upload Scorecard evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: v1-rc3-scorecard-evidence
+          path: |
+            scorecard.json
+            scorecard-summary.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  final-gate:
+    needs:
+      - tree-guard
+      - semgrep
+      - secret-history
+      - scorecard
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Mark multi-scanner gate successful
+        run: |
+          echo 'RC3 runtime tree: verified'
+          echo 'Semgrep ERROR blockers: 0'
+          echo 'Gitleaks full-history secret blockers: 0'
+          echo 'OpenSSF release-relevant checks: passed'
+          echo 'Final multi-scanner security audit gate: PASS'
