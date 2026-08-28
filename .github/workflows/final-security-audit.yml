@@ -133,20 +133,26 @@ jobs:
   scorecard:
     needs: tree-guard
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Run OpenSSF Scorecard v2.4.4 / Scorecard v5.5.0
-        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
-        with:
-          results_file: scorecard.json
-          results_format: json
-          publish_results: false
+      - name: Install verified OpenSSF Scorecard v5.5.0 CLI
+        run: |
+          curl --fail --silent --show-error --location \
+            --output scorecard.tar.gz \
+            'https://github.com/ossf/scorecard/releases/download/v5.5.0/scorecard_5.5.0_linux_amd64.tar.gz'
+          echo '83b90a05c1540ef1390db1cd5711e5fd04be9c1d8537fb84d39d02092d6a8dff  scorecard.tar.gz' | sha256sum --check --strict
+          mkdir -p /tmp/scorecard-bin
+          tar -xzf scorecard.tar.gz -C /tmp/scorecard-bin scorecard
+          /tmp/scorecard-bin/scorecard version
+      - name: Scan default branch RC2 with OpenSSF Scorecard
+        env:
+          GITHUB_AUTH_TOKEN: ${{ github.token }}
+        run: |
+          /tmp/scorecard-bin/scorecard --repo=github.com/nqtplus/GPTHands --format=json > scorecard.json
       - name: Enforce release-relevant Scorecard checks
         run: |
           python - <<'PY'
@@ -172,6 +178,9 @@ jobs:
               if not isinstance(score, (int, float)) or score < minimum:
                   failures.append(f'{name}: score={score}, required>={minimum}')
           summary = {
+              'scorecard_version': '5.5.0',
+              'scanned_repo': 'github.com/nqtplus/GPTHands',
+              'expected_default_branch_sha': '1a983a08d28377c08a3203f6fb0866c45861ded0',
               'overall_score': data.get('score'),
               'blocking_checks': selected,
               'failures': failures,
