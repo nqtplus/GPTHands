@@ -1,0 +1,44 @@
+name: CodeQL RC2 Audit
+
+on:
+  push:
+    branches: ["audit/codeql-v1.0.0rc2"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  codeql:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout audit branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Prove runtime tree matches frozen RC2
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASELINE="1a983a08d28377c08a3203f6fb0866c45861ded0"
+          git cat-file -e "$BASELINE^{commit}"
+          changed="$(git diff --name-only "$BASELINE" HEAD -- ':!.github/workflows/codeql-rc2.yml')"
+          if [ -n "$changed" ]; then
+            printf 'Audit branch diverged from frozen RC2 runtime:\n%s\n' "$changed" >&2
+            exit 1
+          fi
+          echo "Runtime matches frozen RC2 baseline $BASELINE"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4, pinned 2026-08-26
+        with:
+          languages: python
+          queries: security-extended,security-and-quality
+
+      - name: Analyze Python security
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4, pinned 2026-08-26
+        with:
+          category: "/language:python/rc2-audit"
