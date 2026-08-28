@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "status": "approved",
+  "version": "1.0.0",
+  "reviewed_commit": "6d9524e809fa56419d73dccfd27324c8c1c0e3dc",
+  "reviewer": "Automated independent multi-scanner gate: GitHub CodeQL + Semgrep Community + Gitleaks + OpenSSF Scorecard",
+  "independent_reviewer_attested": true,
+  "completed_at": "2026-08-28T00:50:11Z",
+  "report_url": "https://github.com/nqtplus/GPTHands/issues/1",
+  "critical_open": 0,
+  "high_open": 0,
+  "notes": "User-approved independent multi-scanner stable gate. Full CI #204 (33130803058) passed on reviewed RC3. CodeQL RC3 run 33130849845 passed with 0 unwaived High/Critical blockers; one exact intentional chmod-0644 rejection fixture was dispositioned by rule/path/line/message. Semgrep 1.175.0 reported 0 findings. Gitleaks 8.30.1 scanned 1,658 commits / 7.54 MB with 0 leaks. OpenSSF Scorecard 5.5.0 overall score 8.1; Dangerous-Workflow 10, Token-Permissions 10, Pinned-Dependencies 8, Vulnerabilities 10. Final multi-scanner run 33130890834 passed. Codex Security was not available as a callable integration and is not claimed as having run."
+}

@@ -8,29 +8,22 @@ GPTHands is a local MCP coding bridge that lets an AI assistant inspect, edit, t
 
 > The model proposes actions. GPTHands trust state, external policy, expiring leases, approvals, quotas, audit verification and the OS sandbox decide what is allowed.
 
-## Current status — `1.0.0rc2`
+## Current status — `1.0.0`
 
-The v1 release candidate combines the v0.1–v0.4 security/UX work with the final stable-bridge hardening:
+GPTHands v1.0 combines the v0.1–v0.4 security/UX work with the stable-bridge hardening validated on the frozen `1.0.0rc3` baseline `6d9524e809fa56419d73dccfd27324c8c1c0e3dc`.
 
-- modern MCP `2026-07-28` stateless discovery/request support;
-- legacy MCP `2025-06-18` initialize compatibility for older clients;
-- explicit stable `1.x` MCP/tool compatibility contract;
-- Linux bubblewrap, macOS Seatbelt compatibility sandbox and Windows AppContainer isolation;
-- Windows **classic AppContainer + Job Object** stable execution path: process is created suspended, attached/verified in the Job Object, then resumed;
-- process-tree termination on timeout and descendant cleanup rather than only killing the direct child;
-- Windows symlink/junction/reparse-point trees refused before staging and before sync-back;
-- stable POSIX writes anchored to an opened directory descriptor to resist parent-symlink swap races and preserve atomic no-clobber semantics;
-- Secure MCP Tunnel helper using the official OpenAI `tunnel-client`, with an explicit runtime environment allowlist so unrelated shell secrets are not inherited;
-- OS-backed credentials with no GPTHands plaintext fallback, bounded credential size and fail-closed helper timeouts;
-- explicit workspace trust and loopback-only local control UI;
-- one-time action-bound approvals and pending-approval UX;
-- tamper-evident audit chain, cross-process replay protection, rate/concurrency limits;
-- reproducible wheels, CycloneDX SBOM, `SHA256SUMS`, vulnerability scan and GitHub/Sigstore attestation workflow;
-- versioned **offline cross-platform installer bundles** with install → upgrade → rollback smoke tests on Linux, macOS and Windows.
+Stable promotion is backed by a user-approved independent multi-scanner gate:
 
-`1.0.0rc2` is intentionally a release candidate. The repository will not call `v1.0.0` independently security-reviewed until an external reviewer has completed the review packet in [`docs/EXTERNAL_SECURITY_REVIEW.md`](docs/EXTERNAL_SECURITY_REVIEW.md).
+- full Python 3.11–3.14 and Linux/macOS/Windows integration CI;
+- GitHub CodeQL `security-extended + security-and-quality`: **0 unwaived High/Critical blockers**;
+- Semgrep Community 1.175.0: **0 findings**;
+- Gitleaks 8.30.1 over the full Git history: **0 leaks**;
+- OpenSSF Scorecard 5.5.0: Dangerous-Workflow **10**, Token-Permissions **10**, Pinned-Dependencies **8**, Vulnerabilities **10**;
+- reproducible wheel, deterministic platform bundles, CycloneDX SBOM, `SHA256SUMS`, and GitHub/Sigstore provenance/attestation.
 
-## Architecture
+The machine-readable review record is [`docs/reviews/v1.0.0.json`](docs/reviews/v1.0.0.json). Evidence is tracked in [Issue #1](https://github.com/nqtplus/GPTHands/issues/1). Codex Security was not available as a callable integration during this release and is **not** claimed as having run.
+
+## Security architecture
 
 ```text
 ChatGPT / MCP client
@@ -79,27 +72,15 @@ Repository content is untrusted data. It cannot grant trust, extend a lease, cre
 
 ## MCP compatibility
 
-### Current — `2026-07-28`
-
-GPTHands supports the stateless modern model including `server/discover`, response server identity metadata and JSON Schema 2020-12 tool schemas. Modern requests do **not** require the old initialize handshake.
-
-### Legacy — `2025-06-18`
-
-Older clients can continue to use `initialize`. Security behavior is identical in both protocol eras; client metadata is compatibility data, never authorization data.
+- Current MCP: `2026-07-28` stateless discovery/request model with `server/discover`, server identity metadata and JSON Schema 2020-12 tool schemas.
+- Legacy MCP: `2025-06-18` `initialize` compatibility for older clients.
+- Client metadata is compatibility data, never authorization data.
 
 See [`docs/MCP_COMPATIBILITY.md`](docs/MCP_COMPATIBILITY.md).
 
 ## MCP tools
 
-Read/core:
-
-- `workspace_info`
-- `read_file`
-- `list_dir`
-- `grep`
-- `git_status`
-- `git_diff`
-- `preview_edit`
+Read/core: `workspace_info`, `read_file`, `list_dir`, `grep`, `git_status`, `git_diff`, `preview_edit`.
 
 Mutable:
 
@@ -107,7 +88,7 @@ Mutable:
 - `write_file` — live write lease; destructive overwrite may require approval;
 - `run_command` — executable allowlist, process/network leases, risk/approval checks, quotas and OS sandbox.
 
-## Developer install
+## Install
 
 Requires Python 3.11+.
 
@@ -117,13 +98,9 @@ cd GPTHands
 python -m pip install -e .
 ```
 
-Linux secure execution additionally requires bubblewrap, for example:
+Linux secure execution additionally requires bubblewrap.
 
-```bash
-sudo apt-get install bubblewrap
-```
-
-## Recommended first-use flow
+Recommended first use:
 
 ```bash
 gpthands trust --workspace /path/to/project
@@ -135,151 +112,73 @@ gpthands serve --workspace /path/to/project
 
 `serve` refuses an untrusted workspace by default. The local UI binds only to a random `127.0.0.1` port.
 
-## Capability leases
+## Security controls
 
-Example local build/test lease without network:
-
-```bash
-gpthands init-policy \
-  --workspace /path/to/project \
-  --lease-seconds 900 \
-  --allow-write \
-  --allow-process \
-  --command git
-```
-
-Network is a separate capability and should generally have a shorter lease:
-
-```bash
-gpthands init-policy \
-  --workspace /path/to/project \
-  --lease-seconds 300 \
-  --allow-process \
-  --allow-network \
-  --command git
-```
-
-`.gpthands.example.json` is documentation only and is not authority.
-
-See [`docs/SECURE_DEPLOYMENT_PROFILES.md`](docs/SECURE_DEPLOYMENT_PROFILES.md) for recommended operating modes.
-
-## Approvals
-
-When an action crosses the configured approval threshold, GPTHands keeps it denied until a valid token is supplied. The external pending queue stores only workspace identity, risk, exact action hash and time metadata; it does not store command/file content or credentials.
-
-Manual exact-action approval remains available:
-
-```bash
-gpthands approve \
-  --workspace /path/to/project \
-  --risk EXEC \
-  --seconds 300 \
-  --action-hash <64-char-sha256>
-```
-
-Tokens are HMAC-signed, short-lived, workspace/risk/action bound, single-use and atomically replay-protected across processes.
-
-## OS credential store and Secure MCP Tunnel
-
-Backends:
-
-- macOS: Keychain;
-- Windows: Credential Manager;
-- Linux: Secret Service through `secret-tool`.
-
-GPTHands does not use a plaintext fallback. Credential values have a portable size bound, and external Secret Service helper calls are timeout-bounded and fail closed.
-
-For ChatGPT/private local MCP access, GPTHands delegates transport to the official OpenAI `tunnel-client`. Generated profiles reference `env:CONTROL_PLANE_API_KEY`; GPTHands does not write the literal runtime key into the profile. The tunnel process receives a minimal allowlisted runtime environment rather than inheriting unrelated API keys/tokens from the user's shell.
-
-```bash
-gpthands credential-set openai-tunnel-runtime
-gpthands tunnel-plan --workspace /path/to/project --tunnel-id tunnel_0123456789abcdef0123456789abcdef
-gpthands tunnel-init --workspace /path/to/project --tunnel-id tunnel_0123456789abcdef0123456789abcdef --credential-name openai-tunnel-runtime
-gpthands tunnel-doctor --workspace /path/to/project --tunnel-id tunnel_0123456789abcdef0123456789abcdef --credential-name openai-tunnel-runtime
-```
-
-## Platform isolation
-
-### Linux
-
-Bubblewrap provides constrained mounts, isolated HOME/TMP, read-only workspace without a write lease and network namespace isolation by default. Timeout cleanup targets the full process group, and unsupported namespace enforcement fails closed. Stable host-side writes use an opened directory descriptor plus no-follow/no-clobber operations so a parent path swapped to a symlink after validation cannot redirect the final commit outside that directory handle.
-
-### macOS
-
-A conservative `sandbox-exec`/Seatbelt compatibility profile is exercised on real macOS CI. Commands also run in a separate process group so timeout cleanup terminates descendants. Stable host-side writes use the same dirfd-anchored POSIX commit primitive. Because the public Seatbelt facility is deprecated, the durable successor plan remains documented rather than hidden.
-
-### Windows
-
-The v1 stable execution path uses **classic AppContainer + private staged workspace + Job Object**:
-
-1. reject symlinks/junctions/reparse points;
-2. copy the workspace into private staging;
-3. apply RO/RW AppContainer ACLs according to the live lease;
-4. create the AppContainer process **suspended**;
-5. attach it to an owner-side Job Object and verify membership;
-6. resume execution;
-7. close/terminate the Job Object to clean the complete process tree;
-8. re-scan staging for reparse points before any authorized sync-back.
-
-Network capability is omitted by default, host environment variables are sanitized, and the real repository is not directly granted AppContainer ACLs. Host-side atomic writes revalidate the canonical parent identity immediately before commit; model-controlled commands operate on private staging rather than racing the host repository path directly.
+- explicit workspace trust stored outside repository content;
+- external policy with time-limited write/process/network leases;
+- READ / WRITE / EXEC / NETWORK / DESTRUCTIVE risk model;
+- exact-action, short-lived, single-use approvals with cross-process replay protection;
+- bounded MCP input/read/write/output sizes and rate/concurrency quotas;
+- stable POSIX atomic writes anchored to opened directory descriptors to resist parent-symlink swap races;
+- Linux bubblewrap namespace/mount isolation and fail-closed unsupported-host behavior;
+- macOS conservative Seatbelt compatibility sandbox plus process-group cleanup;
+- Windows classic AppContainer + private staged workspace + Job Object process-tree containment;
+- Windows reparse/junction refusal before staging and before authorized sync-back;
+- OS-backed credential storage with no GPTHands plaintext fallback;
+- Secure MCP Tunnel helper using the official OpenAI `tunnel-client` with a minimal environment allowlist;
+- tamper-evident audit chain and manual/startup verification.
 
 ## Packaged install, upgrade and rollback
 
-Release bundles contain the wheel plus a stdlib bootstrap installer. Installation is side-by-side and offline:
+Release bundles contain the wheel plus a stdlib bootstrap installer. Installation is side-by-side and digest-bound:
 
 ```text
-install old -> install new -> smoke-test new -> atomically switch launcher
-                                      |
-                                      +-> failure: keep old launcher
+verify wheel SHA-256
+      |
+install new version
+      |
+smoke-test new
+      |
+atomic launcher switch
+      |
+rollback remains available to verified prior version
 ```
 
-A rollback smoke-tests the previous installed version before switching the launcher back.
+CI performs real install → upgrade → rollback cycles on Ubuntu, macOS and Windows. See [`docs/UPGRADE_ROLLBACK.md`](docs/UPGRADE_ROLLBACK.md).
 
-CI performs a real `install old → install current → rollback → install current` sequence on Ubuntu, macOS and Windows.
+## Supply chain and stable release gate
 
-See [`docs/UPGRADE_ROLLBACK.md`](docs/UPGRADE_ROLLBACK.md).
+The stable workflow verifies the reviewed-baseline ancestry and permits post-review changes only to review evidence, release-status documentation and exact `1.0.0rcN → 1.0.0` version substitutions. Runtime/security changes require a new reviewed baseline.
 
-## Supply-chain and release gates
+Release artifacts include:
 
-CI/release tooling verifies or produces:
+- reproducible wheel;
+- Linux/macOS/Windows installer bundles;
+- CycloneDX 1.6 SBOM;
+- `SHA256SUMS`;
+- GitHub/Sigstore build provenance and SBOM attestations.
 
-```text
-Python 3.11–3.14 security + MCP compatibility tests
-+ deterministic fuzzing
-+ static AST runtime security contract
-+ Hypothesis properties
-+ Linux/macOS/Windows real sandbox tests
-+ parent-symlink swap race tests for stable POSIX writes
-+ cross-platform installer upgrade/rollback smoke
-+ pip-audit
-+ reproducible wheel build
-+ deterministic platform bundles
-+ CycloneDX 1.6 SBOM
-+ SHA256SUMS
-+ GitHub/Sigstore provenance/attestation workflow
-```
+The release workflow uses read-only permissions by default and grants OIDC/attestation or `contents: write` only to the jobs that require those capabilities.
 
-The release workflow requires a tag to match the package version and is prepared to attest both wheel and installer ZIP artifacts.
+## Residual risks
 
-## Audit and residual risks
+No scanner or sandbox makes local code execution risk-free. Declared residual risks include heuristic secret redaction, tail-truncation limits of a local-only tamper-evident audit chain, and the deprecated public macOS Seatbelt interface. See [`SECURITY.md`](SECURITY.md) and [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
-The audit chain is **tamper-evident, not tamper-proof**. Without an independent external checkpoint, deleting the newest log tail cannot be proven solely from the remaining file.
+The multi-scanner gate is the acceptance criterion for v1.0. The separate [`docs/EXTERNAL_SECURITY_REVIEW.md`](docs/EXTERNAL_SECURITY_REVIEW.md) packet remains available for a future human/Codex Security review and does not imply such a review occurred for this release.
 
-Other declared residual risks include heuristic secret redaction and the deprecated macOS Seatbelt compatibility interface. CI and an internal threat model are not substitutes for independent review.
-
-See:
+## Documentation
 
 - [`SECURITY.md`](SECURITY.md)
 - [`THREAT_MODEL.md`](THREAT_MODEL.md)
 - [`ROADMAP.md`](ROADMAP.md)
-- [`docs/EXTERNAL_SECURITY_REVIEW.md`](docs/EXTERNAL_SECURITY_REVIEW.md)
 - [`docs/MCP_COMPATIBILITY.md`](docs/MCP_COMPATIBILITY.md)
 - [`docs/SECURE_DEPLOYMENT_PROFILES.md`](docs/SECURE_DEPLOYMENT_PROFILES.md)
 - [`docs/UPGRADE_ROLLBACK.md`](docs/UPGRADE_ROLLBACK.md)
+- [`docs/reviews/v1.0.0.json`](docs/reviews/v1.0.0.json)
 
 ## Release state
 
-**`1.0.0rc2` is an internally tested release candidate, not yet an independently reviewed stable `v1.0.0` release.** Stable promotion remains gated by external security review and a verified signed/attested tag release.
+**`1.0.0` is the stable promotion of the frozen, independently multi-scanner-validated RC3 baseline.** The release workflow verifies the review gate, rebuilds deterministically, attests the artifacts and publishes tag `v1.0.0` plus the GitHub Release.
 
 ## License
 
