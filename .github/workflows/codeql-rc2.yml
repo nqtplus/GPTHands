@@ -39,6 +39,91 @@ jobs:
           queries: security-extended,security-and-quality
 
       - name: Analyze Python security
+        id: analyze
         uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4, pinned 2026-08-26
         with:
           category: "/language:python/rc2-audit"
+          output: codeql-sarif
+          upload: always
+          wait-for-processing: true
+
+      - name: Summarize SARIF and block High/Critical security findings
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path('codeql-sarif')
+          files = sorted(root.rglob('*.sarif'))
+          if not files:
+              raise SystemExit('CodeQL produced no SARIF files')
+
+          rows = []
+          blockers = []
+          for path in files:
+              doc = json.loads(path.read_text(encoding='utf-8'))
+              for run in doc.get('runs', []):
+                  rules = {}
+                  driver = run.get('tool', {}).get('driver', {})
+                  for rule in driver.get('rules', []) or []:
+                      rid = rule.get('id')
+                      if rid:
+                          rules[rid] = rule
+                  for ext in run.get('tool', {}).get('extensions', []) or []:
+                      for rule in ext.get('rules', []) or []:
+                          rid = rule.get('id')
+                          if rid:
+                              rules.setdefault(rid, rule)
+
+                  for result in run.get('results', []) or []:
+                      rid = result.get('ruleId', '<unknown>')
+                      rule = rules.get(rid, {})
+                      props = dict(rule.get('properties') or {})
+                      props.update(result.get('properties') or {})
+                      raw_score = props.get('security-severity')
+                      try:
+                          score = float(raw_score) if raw_score is not None else None
+                      except (TypeError, ValueError):
+                          score = None
+                      level = result.get('level') or rule.get('defaultConfiguration', {}).get('level') or 'warning'
+                      message = (result.get('message') or {}).get('text', '').replace('\n', ' ')[:500]
+                      location = '<unknown>'
+                      locs = result.get('locations') or []
+                      if locs:
+                          phys = (locs[0].get('physicalLocation') or {})
+                          uri = ((phys.get('artifactLocation') or {}).get('uri'))
+                          line = ((phys.get('region') or {}).get('startLine'))
+                          if uri:
+                              location = f"{uri}:{line}" if line else uri
+                      row = {
+                          'rule': rid,
+                          'security_severity': score,
+                          'level': level,
+                          'location': location,
+                          'message': message,
+                      }
+                      rows.append(row)
+                      if score is not None and score >= 7.0:
+                          blockers.append(row)
+
+          print(json.dumps({
+              'sarif_files': [str(p) for p in files],
+              'finding_count': len(rows),
+              'high_or_critical_count': len(blockers),
+              'findings': rows,
+          }, indent=2, ensure_ascii=False))
+
+          if blockers:
+              raise SystemExit(f'CodeQL release gate blocked: {len(blockers)} High/Critical finding(s)')
+          print('CodeQL RC2 gate: no High/Critical security findings')
+          PY
+
+      - name: Preserve CodeQL SARIF evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codeql-v1.0.0rc2-sarif
+          path: codeql-sarif/
+          if-no-files-found: error
+          retention-days: 30
